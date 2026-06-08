@@ -1619,90 +1619,11 @@ def _edit_cage_form(cage):
 
 # ── Settings ───────────────────────────────────────────────────────
 
-def _load_demo_data():
-    """Populate the database with sample mice, cages, and litters."""
-    stats = db.get_stats()
-    if stats["total_mice"] > 0:
-        return  # already has data, don't duplicate
-
-    # Founder mice
-    m1 = db.add_mouse("F-M001", "2024-06-01", "M", status="breeding", cage_location="Founder")
-    db.set_genotype(m1, "GeneA", "fl", "fl")
-    db.set_genotype(m1, "GeneB", "Tg", "0")
-
-    m2 = db.add_mouse("F-F001", "2024-06-15", "F", status="breeding", cage_location="Founder")
-    db.set_genotype(m2, "GeneA", "fl", "fl")
-
-    m3 = db.add_mouse("F-M002", "2024-07-01", "M", status="breeding", cage_location="Founder")
-    db.set_genotype(m3, "GeneA", "fl", "+")
-    db.set_genotype(m3, "GeneC", "Tg", "0")
-
-    m4 = db.add_mouse("F-F002", "2024-07-15", "F", status="breeding", cage_location="Founder")
-    db.set_genotype(m4, "GeneA", "fl", "fl")
-
-    # Cages
-    cage1 = db.add_breeding_cage("Breed-01", "breeding", m1, "2025-01-15", "First breeding pair")
-    db.set_cage_females(cage1, [m2])
-    db.update_mouse(m1, status="breeding", cage_location="Breed-01")
-    db.update_mouse(m2, status="breeding", cage_location="Breed-01")
-
-    cage2 = db.add_breeding_cage("Breed-02", "breeding", m3, "2025-01-20", "Second breeding pair")
-    db.set_cage_females(cage2, [m4])
-    db.update_mouse(m3, status="breeding", cage_location="Breed-02")
-    db.update_mouse(m4, status="breeding", cage_location="Breed-02")
-
-    hc1 = db.add_breeding_cage("Hold-01", "holding", None, "2025-03-01", "Weaned pups awaiting genotyping")
-    hc2 = db.add_breeding_cage("Hold-02", "holding", None, "2025-03-15", "Genotyped mice ready for experiments")
-
-    # Litters
-    l1 = db.add_litter(cage1, "2025-02-05", 8, weaned_count=6, weaning_date="2025-02-26")
-    l2 = db.add_litter(cage2, "2025-02-10", 6, weaned_count=5, weaning_date="2025-03-03")
-    l3 = db.add_litter(cage1, "2025-03-15", 7)
-
-    # Pups from litter 1
-    for i, (tag, sex) in enumerate([
-        ("B1-M1", "M"), ("B1-M2", "M"), ("B1-M3", "M"),
-        ("B1-F1", "F"), ("B1-F2", "F"), ("B1-F3", "F"),
-    ]):
-        mid = db.add_mouse(tag, "2025-02-05", sex, father_tag="F-M001", mother_tag="F-F001",
-                           birth_cage_id=cage1, litter_id=l1, status="holding", cage_location="Hold-01")
-        db.set_genotype(mid, "GeneA", "fl", "fl")
-        if sex == "F":
-            db.set_genotype(mid, "GeneB", "Tg", "0")
-
-    # Pups from litter 2
-    for i, (tag, sex) in enumerate([
-        ("B2-M1", "M"), ("B2-M2", "M"), ("B2-M3", "M"),
-        ("B2-F1", "F"), ("B2-F2", "F"),
-    ]):
-        mid = db.add_mouse(tag, "2025-02-10", sex, father_tag="F-M002", mother_tag="F-F002",
-                           birth_cage_id=cage2, litter_id=l2, status="holding", cage_location="Hold-01")
-        db.set_genotype(mid, "GeneA", "fl", "fl")
-        db.set_genotype(mid, "GeneC", "Tg", "0")
-
-    # Pups from litter 3 (pending split)
-    for i, (tag, sex) in enumerate([
-        ("B1-M4", "M"), ("B1-M5", "M"), ("B1-M6", "M"), ("B1-M7", "M"),
-        ("B1-F4", "F"), ("B1-F5", "F"), ("B1-F6", "F"),
-    ]):
-        mid = db.add_mouse(tag, "2025-03-15", sex, father_tag="F-M001", mother_tag="F-F001",
-                           birth_cage_id=cage1, litter_id=l3, status="waiting_split", cage_location="Breed-01")
-        db.set_genotype(mid, "GeneA", "fl", "fl")
-        if sex == "F":
-            db.set_genotype(mid, "GeneB", "Tg", "0")
-
-    # Custom genes for the demo
-    for gene in ["GeneA", "GeneB", "GeneC"]:
-        db.add_custom_gene(gene)
-
-
 def settings_page():
     st.subheader("🧬 Manage Gene Library")
 
-    # Collect all genes from all sources
     custom_genes = set(db.get_custom_genes())
-    db_genes = set(db.get_distinct_genes())
-    all_genes = sorted(custom_genes | db_genes)
+    all_genes = sorted(custom_genes)
 
     # Count mice per gene
     gene_mouse_counts = {}
@@ -1738,37 +1659,17 @@ def settings_page():
         for col, gene in zip(cols, row):
             with col:
                 count = gene_mouse_counts.get(gene, 0)
-                is_custom = gene in custom_genes
-                in_use = gene in db_genes
-
-                tag = "in use" if in_use else "custom" if is_custom else ""
 
                 with st.container(border=True):
                     st.markdown(
                         f'<div style="font-weight:700;font-size:0.92rem;">{gene}</div>'
-                        f'<div style="color:#64748b;font-size:0.75rem;">{tag} · {count} mice</div>',
+                        f'<div style="color:#64748b;font-size:0.75rem;">{count} mice with this gene</div>',
                         unsafe_allow_html=True,
                     )
-
-                    if is_custom:
-                        if st.button("🗑️", key=f"del_gene_{gene}"):
-                            db.remove_custom_gene(gene)
-                            if in_use:
-                                st.warning(f"'{gene}' removed from library (still used by {count} mice).")
-                            else:
-                                st.success(f"'{gene}' removed.")
-                            st.rerun()
-                    elif in_use:
-                        st.caption("from records")
-
-    st.divider()
-    st.subheader("🧪 Demo Data")
-
-    st.caption("Load sample mice, cages, and litters to explore the app.")
-    if st.button("📥 Load Demo Data", key="load_demo"):
-        _load_demo_data()
-        st.success("Demo data loaded! Check the Dashboard and other pages.")
-        st.rerun()
+                    if st.button("🗑️", key=f"del_gene_{gene}"):
+                        db.remove_custom_gene(gene)
+                        st.success(f"'{gene}' removed.")
+                        st.rerun()
 
     st.divider()
     st.subheader("💾 Export / 📥 Import Data")
