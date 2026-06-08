@@ -420,6 +420,11 @@ class DB:
                 (*updates.values(), cage_id),
             )
 
+    def delete_cage(self, cage_id):
+        with self._conn() as c:
+            c.execute("DELETE FROM cage_females WHERE cage_id=?", (cage_id,))
+            c.execute("DELETE FROM breeding_cages WHERE id=?", (cage_id,))
+
     # ── Litters ───────────────────────────────────────────
 
     def add_litter(self, cage_id, birth_date, total_born,

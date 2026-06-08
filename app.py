@@ -1368,60 +1368,126 @@ def _record_litter_form(cage):
     females = female_tag_list(cage)
     default_prefix = cage["cage_label"].replace(" ", "-")
 
-    with st.form(f"record_litter_{cage['id']}"):
-        r1c1, r1c2, r1c3 = st.columns([1, 1, 1])
-        birth = r1c1.date_input("Birth date", value=date.today(), key=f"lit_birth_{cage['id']}")
-        total_born = r1c2.number_input("Born", min_value=1, value=1, step=1, key=f"lit_born_{cage['id']}")
-        if len(females) > 1:
-            mother_tag = r1c3.selectbox("Mother", ["—"] + females, key=f"lit_mother_{cage['id']}")
-            mother_tag = None if mother_tag == "—" else mother_tag
+    # Auto-detect genes from parents
+    parent_genes = []
+    seen = set()
+    for parent_tag in [cage["male_tag"]] + females:
+        if not parent_tag:
+            continue
+        parent = db.get_mouse_by_tag(parent_tag)
+        if parent:
+            for g in db.get_mouse_genotypes(parent["id"]):
+                gene = g["gene"]
+                if gene not in seen:
+                    seen.add(gene)
+                    parent_genes.append(gene)
+
+    # Use litter form key prefix
+    lk = f"lit_{cage['id']}"
+
+    r1c1, r1c2, r1c3 = st.columns([1, 1, 1])
+    birth = r1c1.date_input("Birth date", value=date.today(), key=f"{lk}_birth")
+    if len(females) > 1:
+        mother_tag = r1c3.selectbox("Mother", ["—"] + females, key=f"{lk}_mother")
+        mother_tag = None if mother_tag == "—" else mother_tag
+    else:
+        mother_tag = females[0] if females else None
+        r1c3.text_input("Mother", value=mother_tag or "—", disabled=True)
+
+    tag_prefix = r1c2.text_input("Tag prefix", value=default_prefix, key=f"{lk}_pfx")
+
+    # Pup count control
+    if f"{lk}_count" not in st.session_state:
+        st.session_state[f"{lk}_count"] = 4
+    count = st.session_state[f"{lk}_count"]
+
+    bc1, bc2, bc3, bc4, _ = st.columns([1, 1, 1.6, 1.4, 4])
+    if bc1.button("➖ Remove", key=f"{lk}_minus"):
+        st.session_state[f"{lk}_count"] = max(1, count - 1)
+        st.rerun()
+    if bc2.button("➕ Add", key=f"{lk}_plus"):
+        st.session_state[f"{lk}_count"] = min(20, count + 1)
+        st.rerun()
+    bc3.write(f"**{st.session_state[f'{lk}_count']} pups**")
+    if bc4.button("📋 Copy Geno", key=f"{lk}_copy_geno", help="Copy first pup's genotypes to all"):
+        if count > 1 and parent_genes:
+            for gi in range(len(parent_genes)):
+                a1_val = st.session_state.get(f"{lk}_a1_{gi}_0", "?")
+                a2_val = st.session_state.get(f"{lk}_a2_{gi}_0", "?")
+                for i in range(1, count):
+                    st.session_state[f"{lk}_a1_{gi}_{i}"] = a1_val
+                    st.session_state[f"{lk}_a2_{gi}_{i}"] = a2_val
+        st.rerun()
+
+    count = st.session_state[f"{lk}_count"]
+
+    # Table header
+    n_gene_cols = len(parent_genes)
+    hcols = st.columns([1, 2.2, 1.2] + [2] * n_gene_cols)
+    hcols[0].caption("")
+    hcols[1].caption("Ear Tag / ID")
+    hcols[2].caption("Sex")
+    for gi, gene in enumerate(parent_genes):
+        hcols[3 + gi].caption(gene)
+
+    # Table rows
+    ear_tags = []
+    sexes = []
+    gene_alleles = {g: [] for g in parent_genes}
+
+    for i in range(count):
+        start_num = 1
+        suggested_tag = f"{tag_prefix.strip()}-{int(start_num) + i:02d}" if tag_prefix.strip() else ""
+        if f"{lk}_tag_{i}" not in st.session_state:
+            st.session_state[f"{lk}_tag_{i}"] = suggested_tag
+
+        rcols = st.columns([1, 2.2, 1.2] + [2] * n_gene_cols)
+        rcols[0].caption(f"#{i+1}")
+        with rcols[1]:
+            tag = st.text_input(
+                "Ear Tag / ID", key=f"{lk}_tag_{i}",
+                label_visibility="collapsed", placeholder=suggested_tag,
+            )
+            ear_tags.append(tag.strip())
+        with rcols[2]:
+            s = st.selectbox("Sex", ["U", "M", "F"], key=f"{lk}_sex_{i}", label_visibility="collapsed")
+            sexes.append(s)
+        for gi, gene in enumerate(parent_genes):
+            with rcols[3 + gi]:
+                aac1, aac2 = st.columns(2)
+                with aac1:
+                    a1 = allele_input("A1", key=f"{lk}_a1_{gi}_{i}", compact=True)
+                with aac2:
+                    a2 = allele_input("A2", key=f"{lk}_a2_{gi}_{i}", compact=True)
+                gene_alleles[gene].append((a1, a2))
+
+    notes = st.text_area("Notes", key=f"{lk}_notes")
+
+    # Submit
+    if st.button("📝 Record Litter & Create Pups", key=f"{lk}_submit"):
+        missing = [str(i + 1) for i, tag in enumerate(ear_tags) if not tag]
+        dupes = sorted({t for t in ear_tags if t and ear_tags.count(t) > 1})
+        existing = db.find_existing_ear_tags(ear_tags)
+
+        if missing:
+            st.error("Ear Tag / ID is required for row(s): " + ", ".join(missing))
+        elif dupes:
+            st.error("Duplicate Ear Tag / ID: " + ", ".join(dupes))
+        elif existing:
+            st.error("Ear Tag / ID already exists: " + ", ".join(existing))
         else:
-            mother_tag = females[0] if females else None
-            r1c3.text_input("Mother", value=mother_tag or "—", disabled=True)
-
-        r2c1, r2c2, r2c3 = st.columns([2, 1, 1])
-        tag_prefix = r2c1.text_input("Tag prefix", value=default_prefix, key=f"lit_pfx_{cage['id']}")
-        start_number = r2c2.number_input("Start number", min_value=1, value=1, step=1, key=f"lit_start_{cage['id']}")
-        sex_mode = r2c3.selectbox(
-            "Initial sex",
-            ["U", "M", "F", "Alternating"],
-            key=f"lit_sex_{cage['id']}",
-        )
-        notes = st.text_area("Notes", key=f"lit_notes_{cage['id']}")
-
-        preview = generated_pup_tags(tag_prefix, start_number, total_born)
-        duplicate_tags = db.find_existing_ear_tags(preview)
-        if preview:
-            st.caption(f"Preview: {preview_tags(preview)}")
-        if duplicate_tags:
-            st.warning("Duplicate tags already exist: " + ", ".join(duplicate_tags))
-
-        submitted = st.form_submit_button("Record litter and create pup tags")
-        if submitted:
-            if not tag_prefix.strip():
-                st.error("Tag prefix is required.")
-                return
-            if duplicate_tags:
-                st.error("Fix duplicate tags before creating pups.")
-                return
-
             litter_id = db.add_litter(
                 cage_id=cage["id"],
                 birth_date=str(birth),
-                total_born=int(total_born),
+                total_born=count,
                 notes=notes.strip() or None,
             )
-            for i, tag in enumerate(preview):
-                if sex_mode == "Alternating":
-                    sex = "M" if i % 2 == 0 else "F"
-                elif sex_mode in ("M", "F"):
-                    sex = sex_mode
-                else:
-                    sex = "U"
-                db.add_mouse(
+            for i in range(count):
+                tag = ear_tags[i]
+                mid = db.add_mouse(
                     ear_tag=tag,
                     birth_date=str(birth),
-                    sex=sex,
+                    sex=sexes[i],
                     father_tag=cage["male_tag"] or None,
                     mother_tag=mother_tag,
                     birth_cage_id=cage["id"],
@@ -1430,7 +1496,10 @@ def _record_litter_form(cage):
                     cage_location=cage["cage_label"],
                     notes=f"From litter #{litter_id}",
                 )
-            st.success(f"Recorded litter and created {len(preview)} pup tags.")
+                for gene in parent_genes:
+                    a1, a2 = gene_alleles[gene][i]
+                    db.set_genotype(mid, gene, a1.strip() or "?", a2.strip() or "?")
+            st.success(f"Recorded litter #{litter_id} with {count} pups.")
             st.rerun()
 
 
@@ -1606,7 +1675,10 @@ def _edit_cage_form(cage):
         )
         new_sep = ec3.text_input("Separation Date", value=cage["separation_date"] or "", key=f"sep_{cage['id']}")
         new_notes = st.text_input("Notes", value=cage["notes"] or "", key=f"cno_{cage['id']}")
-        if st.form_submit_button("💾 Save Cage"):
+        c1, c2, _ = st.columns([1, 1, 4])
+        save = c1.form_submit_button("💾 Save Cage")
+        delete = c2.form_submit_button("🗑️ Delete Cage", type="secondary")
+        if save:
             db.update_breeding_cage(
                 cage["id"],
                 cage_label=new_label.strip(),
@@ -1615,6 +1687,11 @@ def _edit_cage_form(cage):
                 notes=new_notes.strip() or None,
             )
             st.success("Updated.")
+            st.rerun()
+        if delete:
+            db.delete_cage(cage["id"])
+            st.session_state.selected_cage_id = None
+            st.warning(f"Cage '{cage['cage_label']}' deleted.")
             st.rerun()
 
 # ── Settings ───────────────────────────────────────────────────────
