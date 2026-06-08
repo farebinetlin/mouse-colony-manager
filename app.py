@@ -1714,11 +1714,31 @@ def settings_page():
             key="export_csv",
         )
 
+    # ── Export Cages CSV ──
+    cages_csv_buf = io.StringIO()
+    cages_writer = csv_module.writer(cages_csv_buf)
+    cages = db.get_all_breeding_cages()
+    if cages:
+        cages_writer.writerow(["Cage Label", "Type", "Male Tag", "Female Tags", "Setup Date", "Status", "Notes"])
+        for c in cages:
+            cages_writer.writerow([
+                c["cage_label"], c["cage_type"], c["male_tag"] or "",
+                c["female_tags"] or "", c["setup_date"] or "",
+                c["status"], c["notes"] or "",
+            ])
+    st.download_button(
+        label="📊 Download Cages (.csv)",
+        data=cages_csv_buf.getvalue(),
+        file_name="mouse_colony_cages.csv",
+        mime="text/csv",
+        key="export_cages_csv",
+    )
+
     st.divider()
     st.caption("Restore from a previous export")
 
     # ── Import DB ──
-    uploaded_db = st.file_uploader("Upload .db file to restore", type=["db"], key="import_db")
+    uploaded_db = st.file_uploader("Upload .db file to restore everything", type=["db"], key="import_db")
     if uploaded_db is not None:
         if st.button("⚠️ Replace current database with uploaded file", key="confirm_db_import"):
             with open(db.path, "wb") as f:
@@ -1726,14 +1746,14 @@ def settings_page():
             st.success("Database replaced. Refreshing...")
             st.rerun()
 
-    # ── Import CSV ──
-    uploaded_csv = st.file_uploader("Upload .csv file to import mice", type=["csv"], key="import_csv")
-    if uploaded_csv is not None:
-        csv_text = uploaded_csv.read().decode("utf-8")
+    # ── Import Mice CSV ──
+    uploaded_mice_csv = st.file_uploader("Upload mice .csv to import", type=["csv"], key="import_mice_csv")
+    if uploaded_mice_csv is not None:
+        csv_text = uploaded_mice_csv.read().decode("utf-8")
         reader = csv_module.DictReader(io.StringIO(csv_text))
         rows = list(reader)
-        st.caption(f"{len(rows)} mice found in CSV")
-        if st.button(f"📥 Import {len(rows)} mice from CSV", key="confirm_csv_import"):
+        st.caption(f"{len(rows)} mice found")
+        if st.button(f"📥 Import {len(rows)} mice", key="confirm_mice_import"):
             imported = 0
             skipped = 0
             for row in rows:
@@ -1754,7 +1774,6 @@ def settings_page():
                     cage_location=(row.get("Cage") or "").strip() or None,
                     notes=(row.get("Notes") or "").strip() or None,
                 )
-                # Parse genotype
                 geno_str = (row.get("Genotype") or "").strip()
                 if geno_str:
                     for part in geno_str.split(";"):
@@ -1764,6 +1783,43 @@ def settings_page():
                             db.set_genotype(mid, match.group(1).strip(), match.group(2), match.group(3))
                 imported += 1
             st.success(f"Imported {imported} mice. Skipped {skipped} duplicates.")
+            st.rerun()
+
+    # ── Import Cages CSV ──
+    uploaded_cages_csv = st.file_uploader("Upload cages .csv to import", type=["csv"], key="import_cages_csv")
+    if uploaded_cages_csv is not None:
+        cages_csv_text = uploaded_cages_csv.read().decode("utf-8")
+        cages_reader = csv_module.DictReader(io.StringIO(cages_csv_text))
+        cages_rows = list(cages_reader)
+        st.caption(f"{len(cages_rows)} cages found")
+        if st.button(f"📥 Import {len(cages_rows)} cages", key="confirm_cages_import"):
+            imported = 0
+            for row in cages_rows:
+                label = (row.get("Cage Label") or "").strip()
+                if not label or db.get_cage_by_label(label):
+                    continue
+                cage_type = (row.get("Type") or "holding").strip()
+                male_tag = (row.get("Male Tag") or "").strip() or None
+                male_id = db.get_mouse_by_tag(male_tag)["id"] if male_tag else None
+                cage_id = db.add_breeding_cage(
+                    cage_label=label,
+                    cage_type=cage_type,
+                    male_id=male_id,
+                    setup_date=(row.get("Setup Date") or "").strip() or None,
+                    notes=(row.get("Notes") or "").strip() or None,
+                )
+                female_tags = [t.strip() for t in (row.get("Female Tags") or "").split(",") if t.strip()]
+                female_ids = [db.get_mouse_by_tag(t)["id"] for t in female_tags if db.get_mouse_by_tag(t)]
+                if female_ids:
+                    db.set_cage_females(cage_id, female_ids)
+                # Update cage mice
+                cage_status = "breeding" if cage_type == "breeding" else "holding"
+                if male_id:
+                    db.update_mouse(male_id, status=cage_status, cage_location=label)
+                for fid in female_ids:
+                    db.update_mouse(fid, status=cage_status, cage_location=label)
+                imported += 1
+            st.success(f"Imported {imported} cages.")
             st.rerun()
 
 # ── Router ────────────────────────────────────────────────────────
