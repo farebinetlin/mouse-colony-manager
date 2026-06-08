@@ -1771,15 +1771,16 @@ def settings_page():
         st.rerun()
 
     st.divider()
-    st.subheader("💾 Export Data")
+    st.subheader("💾 Export / 📥 Import Data")
 
     import io
     import csv as csv_module
 
+    # ── Export ──
+    st.caption("Download your data")
     ec1, ec2 = st.columns(2)
 
     with ec1:
-        # Export SQLite database
         with open(db.path, "rb") as f:
             db_bytes = f.read()
         st.download_button(
@@ -1791,7 +1792,6 @@ def settings_page():
         )
 
     with ec2:
-        # Export mice as CSV
         csv_buf = io.StringIO()
         writer = csv_module.writer(csv_buf)
         mice = db.get_all_mice()
@@ -1806,12 +1806,64 @@ def settings_page():
                     geno,
                 ])
         st.download_button(
-            label="📊 Download Mice (.csv)",
+            label="📊 Download CSV",
             data=csv_buf.getvalue(),
             file_name="mouse_colony_export.csv",
             mime="text/csv",
             key="export_csv",
         )
+
+    st.divider()
+    st.caption("Restore from a previous export")
+
+    # ── Import DB ──
+    uploaded_db = st.file_uploader("Upload .db file to restore", type=["db"], key="import_db")
+    if uploaded_db is not None:
+        if st.button("⚠️ Replace current database with uploaded file", key="confirm_db_import"):
+            with open(db.path, "wb") as f:
+                f.write(uploaded_db.read())
+            st.success("Database replaced. Refreshing...")
+            st.rerun()
+
+    # ── Import CSV ──
+    uploaded_csv = st.file_uploader("Upload .csv file to import mice", type=["csv"], key="import_csv")
+    if uploaded_csv is not None:
+        csv_text = uploaded_csv.read().decode("utf-8")
+        reader = csv_module.DictReader(io.StringIO(csv_text))
+        rows = list(reader)
+        st.caption(f"{len(rows)} mice found in CSV")
+        if st.button(f"📥 Import {len(rows)} mice from CSV", key="confirm_csv_import"):
+            imported = 0
+            skipped = 0
+            for row in rows:
+                tag = (row.get("Ear Tag") or "").strip()
+                if not tag or db.get_mouse_by_tag(tag):
+                    skipped += 1
+                    continue
+                sex = (row.get("Sex") or "U").strip()
+                if sex not in ("M", "F", "U"):
+                    sex = "U"
+                mid = db.add_mouse(
+                    ear_tag=tag,
+                    birth_date=(row.get("Birth Date") or "").strip() or None,
+                    sex=sex,
+                    father_tag=(row.get("Father") or "").strip() or None,
+                    mother_tag=(row.get("Mother") or "").strip() or None,
+                    status=normalize_mouse_status(row.get("Status", "")),
+                    cage_location=(row.get("Cage") or "").strip() or None,
+                    notes=(row.get("Notes") or "").strip() or None,
+                )
+                # Parse genotype
+                geno_str = (row.get("Genotype") or "").strip()
+                if geno_str:
+                    for part in geno_str.split(";"):
+                        part = part.strip()
+                        match = re.match(r"(.+?)\s+(\S+)/(\S+)", part)
+                        if match:
+                            db.set_genotype(mid, match.group(1).strip(), match.group(2), match.group(3))
+                imported += 1
+            st.success(f"Imported {imported} mice. Skipped {skipped} duplicates.")
+            st.rerun()
 
 # ── Router ────────────────────────────────────────────────────────
 
