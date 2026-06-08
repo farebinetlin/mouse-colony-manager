@@ -1,3 +1,4 @@
 mouse_colony.db
 __pycache__/
 .streamlit/
+.DS_Store

@@ -36,8 +36,9 @@ class DB:
                     father_tag TEXT,
                     mother_tag TEXT,
                     birth_cage_id INTEGER REFERENCES breeding_cages(id),
-                    status TEXT DEFAULT 'active'
-                        CHECK(status IN ('active','breeding','genotyping','assigned','sacrificed','dead')),
+                    litter_id INTEGER REFERENCES litters(id),
+                    status TEXT DEFAULT 'holding'
+                        CHECK(status IN ('breeding','holding','waiting_split')),
                     cage_location TEXT,
                     notes TEXT,
                     created_at TEXT DEFAULT (datetime('now','localtime'))
@@ -94,17 +95,90 @@ class DB:
                     notes TEXT,
                     created_at TEXT DEFAULT (datetime('now','localtime'))
                 );
+
+                CREATE TABLE IF NOT EXISTS custom_genes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    gene TEXT UNIQUE NOT NULL,
+                    created_at TEXT DEFAULT (datetime('now','localtime'))
+                );
             """)
+            mouse_cols = {row["name"] for row in c.execute("PRAGMA table_info(mice)").fetchall()}
+            if "litter_id" not in mouse_cols:
+                c.execute("ALTER TABLE mice ADD COLUMN litter_id INTEGER REFERENCES litters(id)")
+            self._migrate_mouse_statuses(c)
+            self._sync_breeding_mouse_statuses(c)
+
+    def _migrate_mouse_statuses(self, c):
+        table_sql = c.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='mice'"
+        ).fetchone()["sql"]
+        if "waiting_split" in table_sql and "'active'" not in table_sql:
+            return
+
+        c.execute("PRAGMA foreign_keys=OFF")
+        c.execute("""
+            CREATE TABLE mice_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ear_tag TEXT UNIQUE NOT NULL,
+                birth_date TEXT,
+                sex TEXT CHECK(sex IN ('M', 'F', 'U')),
+                father_tag TEXT,
+                mother_tag TEXT,
+                birth_cage_id INTEGER REFERENCES breeding_cages(id),
+                litter_id INTEGER REFERENCES litters(id),
+                status TEXT DEFAULT 'holding'
+                    CHECK(status IN ('breeding','holding','waiting_split')),
+                cage_location TEXT,
+                notes TEXT,
+                created_at TEXT DEFAULT (datetime('now','localtime'))
+            )
+        """)
+        c.execute("""
+            INSERT INTO mice_new (
+                id, ear_tag, birth_date, sex, father_tag, mother_tag,
+                birth_cage_id, litter_id, status, cage_location, notes, created_at
+            )
+            SELECT
+                id, ear_tag, birth_date, sex, father_tag, mother_tag,
+                birth_cage_id, litter_id,
+                CASE
+                    WHEN status='breeding' THEN 'breeding'
+                    WHEN status='genotyping' THEN 'waiting_split'
+                    ELSE 'holding'
+                END,
+                cage_location, notes, created_at
+            FROM mice
+        """)
+        c.execute("DROP TABLE mice")
+        c.execute("ALTER TABLE mice_new RENAME TO mice")
+
+    def _sync_breeding_mouse_statuses(self, c):
+        rows = c.execute("""
+            SELECT bc.cage_label, bc.male_id AS mouse_id
+            FROM breeding_cages bc
+            WHERE bc.cage_type='breeding' AND bc.status='active' AND bc.male_id IS NOT NULL
+            UNION
+            SELECT bc.cage_label, cf.mouse_id
+            FROM breeding_cages bc
+            JOIN cage_females cf ON cf.cage_id = bc.id
+            WHERE bc.cage_type='breeding' AND bc.status='active'
+        """).fetchall()
+        for row in rows:
+            c.execute(
+                "UPDATE mice SET status='breeding', cage_location=? WHERE id=?",
+                (row["cage_label"], row["mouse_id"]),
+            )
 
     # ── Mice ──────────────────────────────────────────────
 
     def add_mouse(self, ear_tag, birth_date=None, sex="U", father_tag=None,
-                  mother_tag=None, birth_cage_id=None, status="active", cage_location=None, notes=None):
+                  mother_tag=None, birth_cage_id=None, litter_id=None,
+                  status="holding", cage_location=None, notes=None):
         with self._conn() as c:
             c.execute(
-                "INSERT INTO mice (ear_tag, birth_date, sex, father_tag, mother_tag, birth_cage_id, status, cage_location, notes) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
-                (ear_tag, birth_date, sex, father_tag, mother_tag, birth_cage_id, status, cage_location, notes),
+                "INSERT INTO mice (ear_tag, birth_date, sex, father_tag, mother_tag, birth_cage_id, litter_id, status, cage_location, notes) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (ear_tag, birth_date, sex, father_tag, mother_tag, birth_cage_id, litter_id, status, cage_location, notes),
             )
             return c.lastrowid
 
@@ -125,7 +199,7 @@ class DB:
             return c.execute("SELECT * FROM mice ORDER BY id DESC").fetchall()
 
     def update_mouse(self, mouse_id, **kwargs):
-        valid = {"ear_tag", "birth_date", "sex", "father_tag", "mother_tag", "birth_cage_id", "status", "cage_location", "notes"}
+        valid = {"ear_tag", "birth_date", "sex", "father_tag", "mother_tag", "birth_cage_id", "litter_id", "status", "cage_location", "notes"}
         updates = {k: v for k, v in kwargs.items() if k in valid}
         if not updates:
             return
@@ -153,6 +227,23 @@ class DB:
             return c.execute(
                 "SELECT * FROM mice WHERE birth_cage_id=? ORDER BY ear_tag", (cage_id,)
             ).fetchall()
+
+    def get_mice_by_litter(self, litter_id):
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM mice WHERE litter_id=? ORDER BY ear_tag", (litter_id,)
+            ).fetchall()
+
+    def find_existing_ear_tags(self, ear_tags):
+        if not ear_tags:
+            return []
+        placeholders = ",".join("?" for _ in ear_tags)
+        with self._conn() as c:
+            rows = c.execute(
+                f"SELECT ear_tag FROM mice WHERE ear_tag IN ({placeholders}) ORDER BY ear_tag",
+                tuple(ear_tags),
+            ).fetchall()
+            return [r["ear_tag"] for r in rows]
 
     def get_mice_by_genotype(self, gene, allele):
         with self._conn() as c:
@@ -194,6 +285,31 @@ class DB:
                 "SELECT DISTINCT gene FROM genotypes ORDER BY gene"
             ).fetchall()
             return [r["gene"] for r in rows]
+
+    def get_custom_genes(self):
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT gene FROM custom_genes ORDER BY gene"
+            ).fetchall()
+            return [r["gene"] for r in rows]
+
+    def add_custom_gene(self, gene):
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO custom_genes (gene) VALUES (?)", (gene.strip(),)
+            )
+
+    def remove_custom_gene(self, gene):
+        with self._conn() as c:
+            c.execute("DELETE FROM custom_genes WHERE gene=?", (gene.strip(),))
+
+    def set_custom_genes(self, genes):
+        with self._conn() as c:
+            c.execute("DELETE FROM custom_genes")
+            for gene in genes:
+                gene = gene.strip()
+                if gene:
+                    c.execute("INSERT OR IGNORE INTO custom_genes (gene) VALUES (?)", (gene,))
 
     def get_mice_for_gene(self, gene):
         with self._conn() as c:
@@ -267,6 +383,30 @@ class DB:
                 ).fetchall()
             return c.execute(base + " ORDER BY bc.id DESC").fetchall()
 
+    def get_cage_by_label(self, cage_label):
+        with self._conn() as c:
+            return c.execute(
+                f"""SELECT bc.*, m.ear_tag AS male_tag, {self._female_subquery()}
+                   FROM breeding_cages bc
+                   LEFT JOIN mice m ON bc.male_id = m.id
+                   WHERE bc.cage_label=?""",
+                (cage_label,),
+            ).fetchone()
+
+    def get_or_create_holding_cage(self, cage_label, setup_date=None, notes=None):
+        existing = self.get_cage_by_label(cage_label)
+        if existing:
+            if existing["cage_type"] != "holding":
+                raise ValueError(f"Cage '{cage_label}' already exists and is not a holding cage.")
+            return existing["id"]
+        return self.add_breeding_cage(
+            cage_label=cage_label,
+            cage_type="holding",
+            male_id=None,
+            setup_date=setup_date,
+            notes=notes,
+        )
+
     def update_breeding_cage(self, cage_id, **kwargs):
         valid = {"cage_label", "cage_type", "male_id", "setup_date",
                  "separation_date", "status", "notes"}
@@ -299,6 +439,10 @@ class DB:
                 (cage_id,),
             ).fetchall()
 
+    def get_litter(self, litter_id):
+        with self._conn() as c:
+            return c.execute("SELECT * FROM litters WHERE id=?", (litter_id,)).fetchone()
+
     def get_all_litters(self):
         with self._conn() as c:
             return c.execute(
@@ -318,6 +462,40 @@ class DB:
             c.execute(
                 f"UPDATE litters SET {set_clause} WHERE id=?",
                 (*updates.values(), litter_id),
+            )
+
+    def delete_litter(self, litter_id, delete_pups=False):
+        with self._conn() as c:
+            if delete_pups:
+                c.execute("DELETE FROM mice WHERE litter_id=?", (litter_id,))
+            else:
+                c.execute("UPDATE mice SET litter_id=NULL WHERE litter_id=?", (litter_id,))
+            c.execute("DELETE FROM litters WHERE id=?", (litter_id,))
+
+    def split_litter(self, litter_id, assignments, male_cage_label, female_cage_label,
+                     weaning_date, weaned_count=None):
+        """Assign litter pups to male/female holding cages and mark the litter weaned."""
+        male_cage_id = self.get_or_create_holding_cage(
+            male_cage_label, setup_date=weaning_date, notes=f"Auto-created for litter #{litter_id}"
+        )
+        female_cage_id = self.get_or_create_holding_cage(
+            female_cage_label, setup_date=weaning_date, notes=f"Auto-created for litter #{litter_id}"
+        )
+        male_cage = self.get_breeding_cage(male_cage_id)
+        female_cage = self.get_breeding_cage(female_cage_id)
+        cage_for_sex = {"M": male_cage["cage_label"], "F": female_cage["cage_label"]}
+
+        with self._conn() as c:
+            for mouse_id, sex in assignments:
+                if sex not in ("M", "F"):
+                    continue
+                c.execute(
+                    "UPDATE mice SET sex=?, status='holding', cage_location=? WHERE id=?",
+                    (sex, cage_for_sex[sex], mouse_id),
+                )
+            c.execute(
+                "UPDATE litters SET weaning_date=?, weaned_count=? WHERE id=?",
+                (weaning_date, weaned_count if weaned_count is not None else len(assignments), litter_id),
             )
 
     # ── Alerts ────────────────────────────────────────────
@@ -359,8 +537,8 @@ class DB:
                 "active_breeders": c.execute(
                     "SELECT COUNT(*) FROM breeding_cages WHERE status='active' AND cage_type='breeding'"
                 ).fetchone()[0],
-                "pending_genotyping": c.execute(
-                    "SELECT COUNT(*) FROM mice WHERE status='genotyping'"
+                "waiting_split": c.execute(
+                    "SELECT COUNT(*) FROM mice WHERE status='waiting_split'"
                 ).fetchone()[0],
                 "unknown_genotypes": c.execute(
                     "SELECT COUNT(DISTINCT mouse_id) FROM genotypes WHERE allele1='?' OR allele2='?'"
