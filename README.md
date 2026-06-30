@@ -12,9 +12,9 @@ streamlit run app.py
 
 ## First Use
 
-1. **⚙️ Settings** → add your gene names
-2. **🐭 Mouse Registry** → add mice or bulk import
-3. **🏠 Cages** → create cages and assign mice
-4. **📊 Dashboard** → overview
+1. **Settings** → add your gene names
+2. **Add / Import** → add mice or bulk import
+3. **Cages** → create cages and assign mice
+4. **Dashboard** → overview
 
 Optional demo data: `python test_data.py`

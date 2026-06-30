@@ -2,22 +2,251 @@ import streamlit as st
 from db import DB
 from datetime import date, timedelta
 import re
+import html
 
 st.set_page_config(page_title="Mouse Colony Manager", page_icon="🐭", layout="wide")
 
 st.markdown("""
 <style>
-    .block-container { padding-top: 2.5rem; padding-bottom: 0; }
+    .block-container {
+        max-width: 1240px;
+        padding-top: 1.35rem;
+        padding-bottom: 2rem;
+    }
+    .app-topbar {
+        align-items: flex-end;
+        border-bottom: 1px solid #e5e7eb;
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 0.7rem;
+        padding-bottom: 0.75rem;
+    }
+    .app-title {
+        color: #111827;
+        font-size: 1.15rem;
+        font-weight: 750;
+        letter-spacing: 0;
+        line-height: 1.2;
+    }
+    .app-subtitle {
+        color: #6b7280;
+        font-size: 0.82rem;
+        margin-top: 0.15rem;
+    }
+    .page-header {
+        margin: 0.85rem 0 0.7rem 0;
+    }
+    .page-header h1 {
+        color: #111827;
+        font-size: 1.45rem;
+        font-weight: 760;
+        letter-spacing: 0;
+        line-height: 1.2;
+        margin: 0;
+    }
+    .page-header p {
+        color: #6b7280;
+        font-size: 0.9rem;
+        margin: 0.2rem 0 0 0;
+    }
+    .empty-panel {
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        margin: 0.75rem 0 0.85rem 0;
+        padding: 0.9rem 1rem;
+    }
+    .empty-panel strong {
+        color: #111827;
+        display: block;
+        font-size: 0.98rem;
+        margin-bottom: 0.2rem;
+    }
+    .empty-panel span {
+        color: #64748b;
+        font-size: 0.88rem;
+    }
+    .summary-card {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-left: 4px solid #94a3b8;
+        border-radius: 8px;
+        min-height: 5.35rem;
+        padding: 0.85rem 0.95rem;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+    .summary-card-blue { border-left-color: #2563eb; }
+    .summary-card-green { border-left-color: #059669; }
+    .summary-card-amber { border-left-color: #d97706; }
+    .summary-card-red { border-left-color: #dc2626; }
+    .summary-label {
+        color: #64748b;
+        font-size: 0.78rem;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+        text-transform: uppercase;
+    }
+    .summary-value {
+        color: #111827;
+        font-size: 1.9rem;
+        font-weight: 780;
+        line-height: 1.1;
+        margin-top: 0.25rem;
+    }
+    .summary-detail {
+        color: #64748b;
+        font-size: 0.82rem;
+        margin-top: 0.22rem;
+    }
+    .section-card {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        min-height: 9rem;
+        padding: 0.9rem 1rem;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.035);
+    }
+    .section-title {
+        color: #111827;
+        font-size: 1rem;
+        font-weight: 750;
+        margin-bottom: 0.55rem;
+    }
+    .soft-row {
+        align-items: center;
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 6px;
+        display: flex;
+        justify-content: space-between;
+        margin-top: 0.45rem;
+        padding: 0.55rem 0.65rem;
+    }
+    .soft-row-title {
+        color: #111827;
+        font-size: 0.88rem;
+        font-weight: 700;
+    }
+    .soft-row-meta {
+        color: #64748b;
+        font-size: 0.78rem;
+        margin-top: 0.1rem;
+    }
+    .empty-note {
+        background: #f8fafc;
+        border: 1px dashed #cbd5e1;
+        border-radius: 6px;
+        color: #64748b;
+        font-size: 0.86rem;
+        padding: 0.7rem 0.75rem;
+    }
+    .gene-chip-wrap {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.45rem;
+    }
+    .gene-chip {
+        align-items: center;
+        background: #ffffff;
+        border: 1px solid #dbe3ef;
+        border-radius: 999px;
+        display: inline-flex;
+        gap: 0.4rem;
+        padding: 0.28rem 0.35rem 0.28rem 0.65rem;
+    }
+    .gene-chip span:first-child {
+        color: #1f2937;
+        font-size: 0.85rem;
+        font-weight: 700;
+    }
+    .gene-chip-count {
+        background: #2563eb;
+        border-radius: 999px;
+        color: #ffffff;
+        font-size: 0.76rem;
+        font-weight: 800;
+        min-width: 1.4rem;
+        padding: 0.08rem 0.42rem;
+        text-align: center;
+    }
+    .mouse-card, .cage-card {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+        min-height: 7.1rem;
+        padding: 0.75rem 0.8rem;
+    }
+    .mouse-card-selected, .cage-card-selected {
+        background: #eff6ff;
+        border-color: #93c5fd;
+        box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.18);
+    }
+    .card-top {
+        align-items: center;
+        display: flex;
+        gap: 0.45rem;
+        justify-content: space-between;
+    }
+    .card-title {
+        color: #111827;
+        font-size: 1rem;
+        font-weight: 780;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .card-meta {
+        color: #64748b;
+        font-size: 0.8rem;
+        line-height: 1.35;
+        margin-top: 0.35rem;
+    }
+    .card-genotype {
+        color: #1f2937;
+        font-size: 0.86rem;
+        font-weight: 700;
+        line-height: 1.3;
+        margin-top: 0.45rem;
+        min-height: 2.2rem;
+    }
+    .status-pill, .sex-pill {
+        border-radius: 999px;
+        display: inline-block;
+        font-size: 0.74rem;
+        font-weight: 800;
+        line-height: 1;
+        padding: 0.24rem 0.48rem;
+        white-space: nowrap;
+    }
+    .sex-m { background: #dbeafe; color: #1d4ed8; }
+    .sex-f { background: #fce7f3; color: #be185d; }
+    .sex-u { background: #f1f5f9; color: #475569; }
+    .tone-breeding { background: #dbeafe; color: #1d4ed8; }
+    .tone-holding { background: #dcfce7; color: #047857; }
+    .tone-waiting_split, .tone-soon, .tone-due { background: #fef3c7; color: #b45309; }
+    .tone-overdue { background: #fee2e2; color: #b91c1c; }
+    .tone-done { background: #e0f2fe; color: #0369a1; }
+    .tone-muted { background: #f1f5f9; color: #475569; }
     .stTabs [data-baseweb="tab-list"] { gap: 0; }
-    .stTabs [data-baseweb="tab"] { padding: 0.3rem 0.6rem; font-size: 0.9rem; }
-    hr { margin: 0.35rem 0; }
-    h3 { margin: 0.25rem 0 0.15rem 0; font-size: 1.1rem; }
-    .stRadio > div { gap: 0.25rem; flex-wrap: wrap; margin-bottom: 0; }
-    .stRadio label { margin: 0; padding: 0.2rem 0.5rem; }
-    .stRadio { margin-bottom: -0.5rem; }
+    .stTabs [data-baseweb="tab"] { padding: 0.35rem 0.65rem; font-size: 0.9rem; }
+    hr { margin: 0.75rem 0; }
+    h3 { margin: 0.35rem 0 0.25rem 0; font-size: 1.08rem; }
     .stMarkdown { margin-bottom: 0; }
-    div[data-testid="stVerticalBlock"] > div { gap: 0.25rem; }
-    .stButton button { padding: 0.25rem 0.5rem; }
+    div[data-testid="stVerticalBlock"] > div { gap: 0.45rem; }
+    div[data-testid="stMetric"] {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        padding: 0.7rem 0.85rem;
+    }
+    div[data-testid="stButton"] button {
+        border-radius: 6px;
+        font-weight: 650;
+        min-height: 2.15rem;
+        padding: 0.3rem 0.7rem;
+    }
     .stSelectbox > div { min-height: unset; }
     .stMultiSelect > div { min-height: unset; }
     section[data-testid="stSidebar"] { display: none; }
@@ -235,6 +464,55 @@ def preview_tags(tags, limit=8):
     return ", ".join(tags[:4] + ["..."] + tags[-2:])
 
 
+def esc(value):
+    return html.escape("" if value is None else str(value), quote=True)
+
+
+def render_summary_card(label, value, detail="", tone="blue"):
+    st.markdown(
+        f"""
+        <div class="summary-card summary-card-{esc(tone)}">
+            <div class="summary-label">{esc(label)}</div>
+            <div class="summary-value">{esc(value)}</div>
+            <div class="summary-detail">{esc(detail)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_section_card(title, body_html):
+    st.markdown(
+        f"""
+        <div class="section-card">
+            <div class="section-title">{esc(title)}</div>
+            {body_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def soft_row(title, meta, badge="", badge_tone="muted"):
+    badge_html = (
+        f'<span class="status-pill tone-{esc(badge_tone)}">{esc(badge)}</span>'
+        if badge else ""
+    )
+    return (
+        '<div class="soft-row">'
+        '<div>'
+        f'<div class="soft-row-title">{esc(title)}</div>'
+        f'<div class="soft-row-meta">{esc(meta)}</div>'
+        '</div>'
+        f'{badge_html}'
+        '</div>'
+    )
+
+
+def render_empty_note(text):
+    return f'<div class="empty-note">{esc(text)}</div>'
+
+
 def due_litters(today=None):
     today = today or date.today()
     items = []
@@ -371,71 +649,145 @@ def render_pedigree(tag, max_depth=3):
 
 # ── Top Navigation ────────────────────────────────────────────────
 
-st.markdown("### 🐭 Mouse Colony Manager")
-page = st.radio(
-    "Navigation",
-    ["📊 Dashboard", "🐭 Mouse Registry", "📋 View / Edit Mice", "🏠 Cages", "⚙️ Settings"],
-    horizontal=True,
-    label_visibility="collapsed",
-    key="main_nav",
-)
-st.divider()
+NAV_ITEMS = [
+    {"key": "dashboard", "label": "Dashboard"},
+    {"key": "add_import", "label": "Add / Import"},
+    {"key": "mice", "label": "Mice"},
+    {"key": "cages", "label": "Cages"},
+    {"key": "settings", "label": "Settings"},
+]
+NAV_KEYS = {item["key"] for item in NAV_ITEMS}
+
+
+def set_current_page(page_key):
+    st.session_state.current_page = page_key if page_key in NAV_KEYS else "dashboard"
+
+
+def go_to_page(page_key):
+    set_current_page(page_key)
+    st.rerun()
+
+
+def render_top_nav():
+    if "current_page" not in st.session_state:
+        set_current_page("dashboard")
+    if st.session_state.current_page not in NAV_KEYS:
+        set_current_page("dashboard")
+
+    st.markdown(
+        """
+        <div class="app-topbar">
+            <div>
+                <div class="app-title">Mouse Colony Manager</div>
+                <div class="app-subtitle">Colony tracking, cages, litters, and genotypes</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    nav_cols = st.columns(len(NAV_ITEMS))
+    for col, item in zip(nav_cols, NAV_ITEMS):
+        is_current = st.session_state.current_page == item["key"]
+        if col.button(
+            item["label"],
+            key=f"nav_{item['key']}",
+            type="primary" if is_current else "secondary",
+            use_container_width=True,
+        ):
+            go_to_page(item["key"])
+
+
+def render_page_header(title, description=""):
+    desc_html = f"<p>{description}</p>" if description else ""
+    st.markdown(
+        f'<div class="page-header"><h1>{title}</h1>{desc_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+render_top_nav()
+page = st.session_state.current_page
 
 # ── Dashboard ─────────────────────────────────────────────────────
 
 def dashboard_page():
+    render_page_header("Dashboard", "Daily overview of colony size, split reminders, and genotype counts.")
     stats = db.get_stats()
     split_due = due_litters()
     gene_rows = gene_combo_stats()
     distinct_genes = db.get_distinct_genes()
+    cages = db.get_all_breeding_cages()
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Total Mice", stats["total_mice"])
-    c2.metric("Gene Types", len(distinct_genes))
-    c3.metric("Split Due", len(split_due))
+    with c1:
+        render_summary_card("Total mice", stats["total_mice"], "All registered mice", "blue")
+    with c2:
+        render_summary_card("Gene types", len(distinct_genes), "Genes in active records", "green")
+    with c3:
+        split_tone = "red" if split_due else "amber"
+        split_detail = "Needs attention" if split_due else "No due litters"
+        render_summary_card("Split due", len(split_due), split_detail, split_tone)
+
+    if stats["total_mice"] == 0 and not distinct_genes and not cages:
+        st.markdown(
+            """
+            <div class="empty-panel">
+                <strong>Start by setting up the colony basics.</strong>
+                <span>Add genes, import mice, then create cages when animals are ready to assign.</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        a1, a2, a3, _ = st.columns([1, 1, 1, 3])
+        if a1.button("Add genes", key="empty_add_genes", use_container_width=True):
+            go_to_page("settings")
+        if a2.button("Import mice", key="empty_import_mice", use_container_width=True):
+            go_to_page("add_import")
+        if a3.button("Create cage", key="empty_create_cage", use_container_width=True):
+            go_to_page("cages")
 
     st.divider()
 
     left, right = st.columns(2)
 
     with left:
-        st.subheader("🧺 Split Reminders")
         if not split_due:
-            st.success("No litters are due for splitting today.")
+            split_html = render_empty_note("No litters are due for splitting today.")
         else:
             today = date.today()
+            rows = []
             for litter, due in split_due[:10]:
                 days = (today - due).days
                 timing = "Due today" if days == 0 else f"Overdue {days}d"
-                st.warning(
-                    f"**{litter['cage_label']}** — born {litter['birth_date']} — "
-                    f"{litter['total_born'] or '?'} born — {timing}"
-                )
+                tone = "due" if days == 0 else "overdue"
+                meta = f"Born {litter['birth_date']} · {litter['total_born'] or '?'} born"
+                rows.append(soft_row(litter["cage_label"], meta, timing, tone))
+            split_html = "".join(rows)
+        render_section_card("Split reminders", split_html)
 
     with right:
-        st.subheader("🐣 Recent Litters")
         litters = db.get_all_litters()
         if not litters:
-            st.info("No litters recorded yet.")
+            recent_html = render_empty_note("No litters recorded yet.")
         else:
-            for l in litters[:10]:
-                st.write(
-                    f"**{l['cage_label']}** — {l['birth_date']} — "
-                    f"{l['total_born']} born, {l['weaned_count'] or 0} weaned"
-                )
+            rows = []
+            for litter in litters[:10]:
+                meta = f"Born {litter['birth_date']} · {litter['total_born']} born"
+                badge = f"{litter['weaned_count'] or 0} weaned"
+                rows.append(soft_row(litter["cage_label"], meta, badge, "done"))
+            recent_html = "".join(rows)
+        render_section_card("Recent litters", recent_html)
 
     st.divider()
-    st.subheader("🧬 Gene Type Counts")
+    st.subheader("Gene Type Counts")
     if gene_rows:
-        chips_html = '<div style="display:flex; flex-wrap:wrap; gap:6px;">'
+        chips_html = '<div class="gene-chip-wrap">'
         for row in gene_rows:
             chips_html += (
-                f'<div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px;'
-                f'padding:4px 10px; display:flex; align-items:center; gap:6px;">'
-                f'<span style="font-weight:600; color:#1e293b; font-size:0.88rem;">{row["Genes"]}</span>'
-                f'<span style="background:#3b82f6; color:#fff; border-radius:999px;'
-                f'padding:1px 7px; font-size:0.78rem; font-weight:700; min-width:20px; text-align:center;">'
-                f'{row["Count"]}</span>'
+                f'<div class="gene-chip">'
+                f'<span>{esc(row["Genes"])}</span>'
+                f'<span class="gene-chip-count">{esc(row["Count"])}</span>'
                 f'</div>'
             )
         chips_html += '</div>'
@@ -447,6 +799,7 @@ def dashboard_page():
 # ── Mouse Registry ────────────────────────────────────────────────
 
 def mouse_registry_page():
+    render_page_header("Add / Import", "Register one mouse or import multiple mice with shared setup details.")
 
     tab_bulk, tab_add = st.tabs(["📥 Bulk Import", "➕ Add Mouse"])
 
@@ -458,6 +811,7 @@ def mouse_registry_page():
 
 
 def view_edit_mice_page():
+    render_page_header("Mice", "Search, filter, review, and edit mouse records.")
     _mouse_list()
 
 
@@ -902,45 +1256,36 @@ def _render_mouse_card(mouse):
     age = mouse_age_label(mouse["birth_date"])
     sym = "♂" if mouse["sex"] == "M" else "♀" if mouse["sex"] == "F" else "?"
     status_label = MOUSE_STATUS_LABELS.get(mouse["status"], mouse["status"])
-    status_emoji = STATUS_EMOJI.get(mouse["status"], "")
+    sex_class = {"M": "sex-m", "F": "sex-f"}.get(mouse["sex"], "sex-u")
+    card_class = "mouse-card mouse-card-selected" if selected else "mouse-card"
+    genotype_text = geno if geno != "—" else "No genotype recorded"
+    parent_bits = []
+    if mouse["father_tag"]:
+        parent_bits.append(f"♂ {mouse['father_tag']}")
+    if mouse["mother_tag"]:
+        parent_bits.append(f"♀ {mouse['mother_tag']}")
+    parent_line = " · ".join(parent_bits) if parent_bits else "No parents recorded"
 
-    sex_color = "#3b82f6" if mouse["sex"] == "M" else "#ec4899" if mouse["sex"] == "F" else "#9ca3af"
-    status_color = {
-        "breeding": "#3b82f6",
-        "holding": "#10b981",
-        "waiting_split": "#f59e0b",
-    }.get(mouse["status"], "#9ca3af")
-
-    with st.container(border=True):
-        # Row 1: sex badge + tag + age
+    with st.container():
         st.markdown(
-            f'<div style="display:flex;align-items:center;justify-content:space-between;">'
-            f'<span>'
-            f'<span style="display:inline-block;background:{sex_color};color:#fff;border-radius:3px;'
-            f'padding:1px 6px;font-size:0.8rem;font-weight:700;margin-right:5px;">{sym}</span>'
-            f'<span style="font-weight:700;font-size:1rem;">{mouse["ear_tag"]}</span>'
-            f'</span>'
-            f'<span style="color:#64748b;font-size:0.85rem;">{age}</span>'
+            f'<div class="{card_class}">'
+            f'<div class="card-top">'
+            f'<div style="display:flex;align-items:center;gap:0.45rem;min-width:0;">'
+            f'<span class="sex-pill {sex_class}">{esc(sym)}</span>'
+            f'<span class="card-title">{esc(mouse["ear_tag"])}</span>'
+            f'</div>'
+            f'<span class="status-pill tone-{esc(mouse["status"])}">{esc(status_label)}</span>'
+            f'</div>'
+            f'<div class="card-genotype">{esc(genotype_text)}</div>'
+            f'<div class="card-meta">{esc(age)} · {esc(parent_line)}</div>'
             f'</div>',
             unsafe_allow_html=True,
         )
-        # Row 2: genotype (prominent, bold)
-        if geno != "—":
-            st.markdown(
-                f'<div style="font-size:0.92rem;font-weight:700;color:#0f172a;margin:2px 0;">{geno}</div>',
-                unsafe_allow_html=True,
-            )
-        # Row 3: status chip + edit button
-        c1, c2 = st.columns([5, 1])
-        c1.markdown(
-            f'<span style="display:inline-block;background:{status_color}18;color:{status_color};'
-            f'border-radius:3px;padding:1px 6px;font-size:0.78rem;font-weight:600;">'
-            f'{status_emoji} {status_label}</span>',
-            unsafe_allow_html=True,
-        )
-        if c2.button(
-            "✏️" if not selected else "✖",
+        if st.button(
+            "Close" if selected else "Open",
             key=f"sel_mouse_{mouse['id']}",
+            use_container_width=True,
+            type="primary" if selected else "secondary",
         ):
             st.session_state.selected_mouse_id = None if selected else mouse["id"]
             st.rerun()
@@ -1148,6 +1493,7 @@ def _mouse_detail_simple(mouse):
 # ── Breeding Cages ────────────────────────────────────────────────
 
 def cages_page():
+    render_page_header("Cages", "Track breeding cages, holding cages, litters, and splitting.")
     inject_cage_styles()
 
     tab_cages, tab_add = st.tabs(["📋 View Cages", "➕ New Cage"])
@@ -1282,49 +1628,48 @@ def _render_cage_card(cage):
     latest_litter = litters[0] if litters else None
     mice = cage_mice(cage)
     type_label = "Breeding" if is_breeding else "Holding"
+    card_class = "cage-card cage-card-selected" if selected else "cage-card"
+    type_tone = "breeding" if is_breeding else "done"
 
-    with st.container(border=True):
-        st.markdown(f"#### {cage['cage_label']}")
+    if is_breeding:
+        parent_line = f"♂ {cage['male_tag'] or '—'} × ♀ {cage['female_tags'] or '—'}"
+        if latest_litter:
+            litter_tone = litter_split_tone(latest_litter)
+            litter_status = litter_split_status(latest_litter)
+            litter_line = f"Latest litter {latest_litter['birth_date']} · {latest_litter['total_born'] or '?'} born"
+        else:
+            litter_tone = "muted"
+            litter_status = "No litter"
+            litter_line = "No litter recorded"
+    else:
+        parent_line = cage["notes"] or "Ready for assigned mice"
+        litter_tone = "done"
+        litter_status = "Holding"
+        litter_line = "Assigned mice only"
+
+    with st.container():
         st.markdown(
-            f"<div class='cage-meta'>{type_label} · {cage['status']} · {len(mice)} mice</div>",
+            f'<div class="{card_class}">'
+            f'<div class="card-top">'
+            f'<span class="card-title">{esc(cage["cage_label"])}</span>'
+            f'<span class="status-pill tone-{type_tone}">{esc(type_label)}</span>'
+            f'</div>'
+            f'<div class="card-meta">{esc(cage["status"])} · {len(mice)} mice</div>'
+            f'<div class="card-genotype">{esc(parent_line)}</div>'
+            f'<div class="card-meta">{esc(litter_line)}</div>'
+            f'<div style="margin-top:0.45rem;">'
+            f'<span class="status-pill tone-{esc(litter_tone)}">{esc(litter_status)}</span>'
+            f'</div>'
+            f'</div>',
             unsafe_allow_html=True,
         )
 
-        if is_breeding:
-            st.markdown(
-                f"<span class='cage-status cage-status-breeding'>Breeding</span>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f"<div class='cage-meta'>♂ {cage['male_tag'] or '—'} × ♀ {cage['female_tags'] or '—'}</div>",
-                unsafe_allow_html=True,
-            )
-            if latest_litter:
-                tone = litter_split_tone(latest_litter)
-                st.markdown(
-                    f"<span class='cage-status cage-status-{tone}'>{litter_split_status(latest_litter)}</span>",
-                    unsafe_allow_html=True,
-                )
-                st.caption(
-                    f"Latest litter: {latest_litter['birth_date']} · "
-                    f"{latest_litter['total_born'] or '?'} born"
-                )
-            else:
-                st.markdown(
-                    "<span class='cage-status cage-status-muted'>No litter recorded</span>",
-                    unsafe_allow_html=True,
-                )
-        else:
-            st.markdown(
-                f"<span class='cage-status cage-status-done'>Holding cage</span>",
-                unsafe_allow_html=True,
-            )
-            st.caption(cage["notes"] or "Ready for assigned mice")
-
-        if st.button("Hide details" if selected else "Open details",
-                     key=f"select_cage_{cage['id']}",
-                     use_container_width=True,
-                     type="primary" if selected else "secondary"):
+        if st.button(
+            "Close details" if selected else "Open details",
+            key=f"select_cage_{cage['id']}",
+            use_container_width=True,
+            type="primary" if selected else "secondary",
+        ):
             st.session_state.selected_cage_id = None if selected else cage["id"]
             st.rerun()
 
@@ -1697,7 +2042,8 @@ def _edit_cage_form(cage):
 # ── Settings ───────────────────────────────────────────────────────
 
 def settings_page():
-    st.subheader("🧬 Manage Gene Library")
+    render_page_header("Settings", "Manage gene names, exports, and imports.")
+    st.subheader("Gene Library")
 
     custom_genes = set(db.get_custom_genes())
     all_genes = sorted(custom_genes)
@@ -1866,13 +2212,13 @@ def settings_page():
 
 # ── Router ────────────────────────────────────────────────────────
 
-if page == "📊 Dashboard":
+if page == "dashboard":
     dashboard_page()
-elif page == "🐭 Mouse Registry":
+elif page == "add_import":
     mouse_registry_page()
-elif page == "📋 View / Edit Mice":
+elif page == "mice":
     view_edit_mice_page()
-elif page == "🏠 Cages":
+elif page == "cages":
     cages_page()
-elif page == "⚙️ Settings":
+elif page == "settings":
     settings_page()
