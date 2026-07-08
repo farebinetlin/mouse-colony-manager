@@ -38,7 +38,7 @@ class DB:
                     birth_cage_id INTEGER REFERENCES breeding_cages(id),
                     litter_id INTEGER REFERENCES litters(id),
                     status TEXT DEFAULT 'holding'
-                        CHECK(status IN ('breeding','holding','waiting_split')),
+                        CHECK(status IN ('breeding','holding','waiting_split','dead')),
                     cage_location TEXT,
                     notes TEXT,
                     created_at TEXT DEFAULT (datetime('now','localtime'))
@@ -86,6 +86,40 @@ class DB:
                     created_at TEXT DEFAULT (datetime('now','localtime'))
                 );
 
+                CREATE TABLE IF NOT EXISTS split_reminders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cage_id INTEGER NOT NULL REFERENCES breeding_cages(id) ON DELETE CASCADE,
+                    due_date TEXT NOT NULL,
+                    resolved INTEGER DEFAULT 0,
+                    resolved_date TEXT,
+                    notes TEXT,
+                    created_at TEXT DEFAULT (datetime('now','localtime'))
+                );
+
+                CREATE TABLE IF NOT EXISTS mouse_weights (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mouse_id INTEGER NOT NULL REFERENCES mice(id) ON DELETE CASCADE,
+                    measure_date TEXT NOT NULL,
+                    weight_g REAL NOT NULL,
+                    notes TEXT,
+                    created_at TEXT DEFAULT (datetime('now','localtime')),
+                    UNIQUE(mouse_id, measure_date)
+                );
+
+                CREATE TABLE IF NOT EXISTS mouse_survival (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mouse_id INTEGER NOT NULL REFERENCES mice(id) ON DELETE CASCADE,
+                    end_date TEXT NOT NULL,
+                    outcome TEXT NOT NULL
+                        CHECK(outcome IN ('dead','euthanized','censored')),
+                    death_method TEXT,
+                    previous_status TEXT,
+                    previous_cage_location TEXT,
+                    notes TEXT,
+                    created_at TEXT DEFAULT (datetime('now','localtime')),
+                    UNIQUE(mouse_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS alerts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     mouse_id INTEGER REFERENCES mice(id) ON DELETE CASCADE,
@@ -101,18 +135,25 @@ class DB:
                     gene TEXT UNIQUE NOT NULL,
                     created_at TEXT DEFAULT (datetime('now','localtime'))
                 );
+
+                CREATE TABLE IF NOT EXISTS gene_colors (
+                    gene TEXT PRIMARY KEY,
+                    color TEXT NOT NULL,
+                    updated_at TEXT DEFAULT (datetime('now','localtime'))
+                );
             """)
             mouse_cols = {row["name"] for row in c.execute("PRAGMA table_info(mice)").fetchall()}
             if "litter_id" not in mouse_cols:
                 c.execute("ALTER TABLE mice ADD COLUMN litter_id INTEGER REFERENCES litters(id)")
             self._migrate_mouse_statuses(c)
+            self._migrate_survival_columns(c)
             self._sync_breeding_mouse_statuses(c)
 
     def _migrate_mouse_statuses(self, c):
         table_sql = c.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='mice'"
         ).fetchone()["sql"]
-        if "waiting_split" in table_sql and "'active'" not in table_sql:
+        if "waiting_split" in table_sql and "'active'" not in table_sql and "'dead'" in table_sql:
             return
 
         c.execute("PRAGMA foreign_keys=OFF")
@@ -127,7 +168,7 @@ class DB:
                 birth_cage_id INTEGER REFERENCES breeding_cages(id),
                 litter_id INTEGER REFERENCES litters(id),
                 status TEXT DEFAULT 'holding'
-                    CHECK(status IN ('breeding','holding','waiting_split')),
+                    CHECK(status IN ('breeding','holding','waiting_split','dead')),
                 cage_location TEXT,
                 notes TEXT,
                 created_at TEXT DEFAULT (datetime('now','localtime'))
@@ -142,6 +183,7 @@ class DB:
                 id, ear_tag, birth_date, sex, father_tag, mother_tag,
                 birth_cage_id, litter_id,
                 CASE
+                    WHEN status='dead' THEN 'dead'
                     WHEN status='breeding' THEN 'breeding'
                     WHEN status='genotyping' THEN 'waiting_split'
                     ELSE 'holding'
@@ -151,6 +193,15 @@ class DB:
         """)
         c.execute("DROP TABLE mice")
         c.execute("ALTER TABLE mice_new RENAME TO mice")
+
+    def _migrate_survival_columns(self, c):
+        survival_cols = {row["name"] for row in c.execute("PRAGMA table_info(mouse_survival)").fetchall()}
+        if "death_method" not in survival_cols:
+            c.execute("ALTER TABLE mouse_survival ADD COLUMN death_method TEXT")
+        if "previous_status" not in survival_cols:
+            c.execute("ALTER TABLE mouse_survival ADD COLUMN previous_status TEXT")
+        if "previous_cage_location" not in survival_cols:
+            c.execute("ALTER TABLE mouse_survival ADD COLUMN previous_cage_location TEXT")
 
     def _sync_breeding_mouse_statuses(self, c):
         rows = c.execute("""
@@ -165,7 +216,7 @@ class DB:
         """).fetchall()
         for row in rows:
             c.execute(
-                "UPDATE mice SET status='breeding', cage_location=? WHERE id=?",
+                "UPDATE mice SET status='breeding', cage_location=? WHERE id=? AND status!='dead'",
                 (row["cage_label"], row["mouse_id"]),
             )
 
@@ -213,6 +264,136 @@ class DB:
     def delete_mouse(self, mouse_id):
         with self._conn() as c:
             c.execute("DELETE FROM mice WHERE id=?", (mouse_id,))
+
+    # ── Weights and Survival ─────────────────────────────
+
+    def upsert_weight(self, mouse_id, measure_date, weight_g, notes=None):
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO mouse_weights (mouse_id, measure_date, weight_g, notes)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT(mouse_id, measure_date)
+                   DO UPDATE SET weight_g=excluded.weight_g, notes=excluded.notes""",
+                (mouse_id, measure_date, weight_g, notes),
+            )
+
+    def delete_weight(self, weight_id):
+        with self._conn() as c:
+            c.execute("DELETE FROM mouse_weights WHERE id=?", (weight_id,))
+
+    def get_weight_records(self, mouse_ids=None):
+        with self._conn() as c:
+            sql = """SELECT w.*, m.ear_tag, m.sex, m.birth_date, m.cage_location
+                     FROM mouse_weights w
+                     JOIN mice m ON w.mouse_id = m.id"""
+            params = []
+            if mouse_ids:
+                placeholders = ",".join("?" for _ in mouse_ids)
+                sql += f" WHERE w.mouse_id IN ({placeholders})"
+                params.extend(mouse_ids)
+            sql += " ORDER BY w.measure_date, m.ear_tag"
+            return c.execute(sql, params).fetchall()
+
+    def set_survival_record(self, mouse_id, end_date, outcome, notes=None,
+                            death_method=None, previous_status=None,
+                            previous_cage_location=None):
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO mouse_survival (
+                       mouse_id, end_date, outcome, death_method,
+                       previous_status, previous_cage_location, notes
+                   )
+                   VALUES (?,?,?,?,?,?,?)
+                   ON CONFLICT(mouse_id)
+                   DO UPDATE SET end_date=excluded.end_date,
+                                 outcome=excluded.outcome,
+                                 death_method=excluded.death_method,
+                                 previous_status=COALESCE(mouse_survival.previous_status, excluded.previous_status),
+                                 previous_cage_location=COALESCE(mouse_survival.previous_cage_location, excluded.previous_cage_location),
+                                 notes=excluded.notes""",
+                (mouse_id, end_date, outcome, death_method, previous_status, previous_cage_location, notes),
+            )
+
+    def mark_mouse_dead(self, mouse_id, death_date, death_method, notes=None):
+        with self._conn() as c:
+            mouse = c.execute("SELECT * FROM mice WHERE id=?", (mouse_id,)).fetchone()
+            if not mouse:
+                raise ValueError("Mouse not found.")
+            existing = c.execute(
+                "SELECT * FROM mouse_survival WHERE mouse_id=?", (mouse_id,)
+            ).fetchone()
+            previous_status = (
+                existing["previous_status"] if existing and existing["previous_status"]
+                else (mouse["status"] if mouse["status"] != "dead" else "holding")
+            )
+            previous_cage = (
+                existing["previous_cage_location"] if existing and existing["previous_cage_location"]
+                else mouse["cage_location"]
+            )
+            outcome = "dead" if death_method == "Natural death" else "censored"
+            c.execute(
+                """INSERT INTO mouse_survival (
+                       mouse_id, end_date, outcome, death_method,
+                       previous_status, previous_cage_location, notes
+                   )
+                   VALUES (?,?,?,?,?,?,?)
+                   ON CONFLICT(mouse_id)
+                   DO UPDATE SET end_date=excluded.end_date,
+                                 outcome=excluded.outcome,
+                                 death_method=excluded.death_method,
+                                 previous_status=COALESCE(mouse_survival.previous_status, excluded.previous_status),
+                                 previous_cage_location=COALESCE(mouse_survival.previous_cage_location, excluded.previous_cage_location),
+                                 notes=excluded.notes""",
+                (mouse_id, death_date, outcome, death_method, previous_status, previous_cage, notes),
+            )
+            c.execute("DELETE FROM cage_females WHERE mouse_id=?", (mouse_id,))
+            c.execute("UPDATE breeding_cages SET male_id=NULL WHERE male_id=?", (mouse_id,))
+            c.execute("UPDATE mice SET status='dead', cage_location=NULL WHERE id=?", (mouse_id,))
+
+    def restore_dead_mouse(self, mouse_id):
+        with self._conn() as c:
+            record = c.execute(
+                "SELECT * FROM mouse_survival WHERE mouse_id=?", (mouse_id,)
+            ).fetchone()
+            if not record:
+                raise ValueError("No death record found for this mouse.")
+            status = record["previous_status"] or "holding"
+            if status not in ("breeding", "holding", "waiting_split"):
+                status = "holding"
+            c.execute(
+                "UPDATE mice SET status=?, cage_location=? WHERE id=?",
+                (status, record["previous_cage_location"], mouse_id),
+            )
+            c.execute("DELETE FROM mouse_survival WHERE mouse_id=?", (mouse_id,))
+
+    def delete_survival_record(self, mouse_id):
+        with self._conn() as c:
+            c.execute("DELETE FROM mouse_survival WHERE mouse_id=?", (mouse_id,))
+
+    def get_survival_records(self, mouse_ids=None):
+        with self._conn() as c:
+            sql = """SELECT s.*, m.ear_tag, m.sex, m.birth_date, m.cage_location, m.status
+                     FROM mouse_survival s
+                     JOIN mice m ON s.mouse_id = m.id"""
+            params = []
+            if mouse_ids:
+                placeholders = ",".join("?" for _ in mouse_ids)
+                sql += f" WHERE s.mouse_id IN ({placeholders})"
+                params.extend(mouse_ids)
+            sql += " ORDER BY s.end_date DESC, m.ear_tag"
+            return c.execute(sql, params).fetchall()
+
+    def get_death_archive(self):
+        with self._conn() as c:
+            return c.execute(
+                """SELECT m.*, s.end_date, s.outcome, s.death_method,
+                          s.previous_status, s.previous_cage_location,
+                          s.notes AS death_notes
+                   FROM mouse_survival s
+                   JOIN mice m ON s.mouse_id = m.id
+                   WHERE m.status='dead' OR s.death_method IS NOT NULL
+                   ORDER BY s.end_date DESC, m.ear_tag"""
+            ).fetchall()
 
     def search_mice(self, query):
         with self._conn() as c:
@@ -302,6 +483,27 @@ class DB:
     def remove_custom_gene(self, gene):
         with self._conn() as c:
             c.execute("DELETE FROM custom_genes WHERE gene=?", (gene.strip(),))
+
+    def get_gene_colors(self):
+        with self._conn() as c:
+            rows = c.execute("SELECT gene, color FROM gene_colors ORDER BY gene").fetchall()
+            return {r["gene"]: r["color"] for r in rows}
+
+    def set_gene_color(self, gene, color):
+        gene = gene.strip()
+        color = color.strip()
+        if not gene or not color:
+            return
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO gene_colors (gene, color, updated_at) "
+                "VALUES (?, ?, datetime('now','localtime'))",
+                (gene, color),
+            )
+
+    def delete_gene_color(self, gene):
+        with self._conn() as c:
+            c.execute("DELETE FROM gene_colors WHERE gene=?", (gene.strip(),))
 
     def set_custom_genes(self, genes):
         with self._conn() as c:
@@ -502,6 +704,46 @@ class DB:
                 "UPDATE litters SET weaning_date=?, weaned_count=? WHERE id=?",
                 (weaning_date, weaned_count if weaned_count is not None else len(assignments), litter_id),
             )
+
+    # ── Split Reminders ─────────────────────────────────────
+
+    def add_split_reminder(self, cage_id, due_date, notes=None):
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO split_reminders (cage_id, due_date, notes) VALUES (?,?,?)",
+                (cage_id, due_date, notes),
+            )
+            return c.lastrowid
+
+    def get_split_reminders_for_cage(self, cage_id, active_only=False):
+        with self._conn() as c:
+            sql = "SELECT * FROM split_reminders WHERE cage_id=?"
+            params = [cage_id]
+            if active_only:
+                sql += " AND resolved=0"
+            sql += " ORDER BY resolved ASC, due_date ASC, id DESC"
+            return c.execute(sql, params).fetchall()
+
+    def get_all_split_reminders(self, active_only=False):
+        with self._conn() as c:
+            sql = """SELECT sr.*, bc.cage_label
+                     FROM split_reminders sr
+                     JOIN breeding_cages bc ON sr.cage_id = bc.id"""
+            if active_only:
+                sql += " WHERE sr.resolved=0"
+            sql += " ORDER BY sr.resolved ASC, sr.due_date ASC, sr.id DESC"
+            return c.execute(sql).fetchall()
+
+    def resolve_split_reminder(self, reminder_id, resolved_date):
+        with self._conn() as c:
+            c.execute(
+                "UPDATE split_reminders SET resolved=1, resolved_date=? WHERE id=?",
+                (resolved_date, reminder_id),
+            )
+
+    def delete_split_reminder(self, reminder_id):
+        with self._conn() as c:
+            c.execute("DELETE FROM split_reminders WHERE id=?", (reminder_id,))
 
     # ── Alerts ────────────────────────────────────────────
 
