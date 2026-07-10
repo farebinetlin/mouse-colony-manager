@@ -2946,6 +2946,39 @@ def _mouse_detail(mouse):
                 st.warning(f"Deleted mouse '{mouse['ear_tag']}'.")
                 st.rerun()
 
+        if mouse["status"] != "dead":
+            st.divider()
+            st.markdown("**Mark dead**")
+            with st.form(f"edit_mouse_mark_dead_{mouse['id']}"):
+                d1, d2 = st.columns([1, 1.35])
+                death_date = d1.date_input(
+                    "Death date",
+                    value=date.today(),
+                    key=f"edit_mouse_death_date_{mouse['id']}",
+                )
+                death_method = d2.selectbox(
+                    "Death method",
+                    DEATH_METHODS,
+                    key=f"edit_mouse_death_method_{mouse['id']}",
+                )
+                death_notes = st.text_input(
+                    "Death notes",
+                    key=f"edit_mouse_death_notes_{mouse['id']}",
+                )
+                mark_dead = st.form_submit_button("Mark dead", type="secondary")
+                if mark_dead:
+                    db.mark_mouse_dead(
+                        mouse["id"],
+                        str(death_date),
+                        death_method,
+                        death_notes.strip() or None,
+                    )
+                    st.session_state.selected_mouse_id = None
+                    st.warning(f"Marked {mouse['ear_tag']} as dead.")
+                    st.rerun()
+        else:
+            st.caption("This mouse is already in Death Archive.")
+
 
 def _mouse_detail_simple(mouse):
     """Compact mouse detail view for cage context (no edit form)."""
@@ -3359,14 +3392,16 @@ def _render_split_reminder_panel(cage):
         st.caption("No active split reminders.")
 
     with st.form(f"add_split_reminder_{cage['id']}"):
-        r1, r2, r3 = st.columns([1.1, 2.8, 0.9])
-        due = r1.date_input(
-            "Due date",
-            value=date.today() + timedelta(days=WEANING_DAYS),
-            key=f"split_rem_due_{cage['id']}",
+        r1, r2, r3, r4 = st.columns([1.1, 1.2, 2.5, 0.9])
+        birth = r1.date_input(
+            "Birth date",
+            value=date.today(),
+            key=f"split_rem_birth_{cage['id']}",
         )
-        notes = r2.text_input("Notes", key=f"split_rem_notes_{cage['id']}")
-        submitted = r3.form_submit_button("Add")
+        due = birth + timedelta(days=WEANING_DAYS)
+        r2.markdown(f"**Due {due}**")
+        notes = r3.text_input("Notes", key=f"split_rem_notes_{cage['id']}")
+        submitted = r4.form_submit_button("Add")
         if submitted:
             db.add_split_reminder(cage["id"], str(due), notes.strip() or None)
             st.success("Split reminder added.")
