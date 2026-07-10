@@ -1,11 +1,25 @@
 import sqlite3
 import os
+import shutil
+import tempfile
 from contextlib import contextmanager
+from datetime import date, datetime
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mouse_colony.db")
+DB_PATH = os.environ.get(
+    "MOUSE_COLONY_DB",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "mouse_colony.db"),
+)
 
 
 class DB:
+    CORE_SCHEMA = {
+        "mice": {"id", "ear_tag", "birth_date", "sex", "status"},
+        "genotypes": {"id", "mouse_id", "gene", "allele1", "allele2"},
+        "breeding_cages": {"id", "cage_label", "cage_type", "status"},
+        "cage_females": {"id", "cage_id", "mouse_id"},
+        "litters": {"id", "cage_id", "birth_date"},
+    }
+
     def __init__(self, path=DB_PATH):
         self.path = path
         self._init_db()
@@ -24,6 +38,98 @@ class DB:
             raise
         finally:
             conn.close()
+
+    @classmethod
+    def validate_database_file(cls, path):
+        if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+            raise ValueError("Database file is empty or missing.")
+        uri = f"file:{os.path.abspath(path)}?mode=ro"
+        try:
+            conn = sqlite3.connect(uri, uri=True)
+            conn.row_factory = sqlite3.Row
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            if integrity != "ok":
+                raise ValueError(f"Database integrity check failed: {integrity}")
+            foreign_key_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if foreign_key_errors:
+                raise ValueError("Database contains broken foreign-key references.")
+            tables = {
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            missing_tables = sorted(set(cls.CORE_SCHEMA) - tables)
+            if missing_tables:
+                raise ValueError(
+                    "Database is missing required tables: " + ", ".join(missing_tables)
+                )
+            for table, required_columns in cls.CORE_SCHEMA.items():
+                columns = {
+                    row["name"]
+                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                missing_columns = sorted(required_columns - columns)
+                if missing_columns:
+                    raise ValueError(
+                        f"Table '{table}' is missing columns: " + ", ".join(missing_columns)
+                    )
+        except sqlite3.DatabaseError as exc:
+            raise ValueError(f"Invalid SQLite database: {exc}") from None
+        finally:
+            if "conn" in locals():
+                conn.close()
+        return True
+
+    def backup_to(self, destination):
+        destination = os.path.abspath(destination)
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        if os.path.exists(destination):
+            os.remove(destination)
+        source = sqlite3.connect(self.path)
+        target = sqlite3.connect(destination)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+        self.validate_database_file(destination)
+        return destination
+
+    def restore_from_bytes(self, data, backup_dir=None):
+        if not data:
+            raise ValueError("Uploaded database is empty.")
+        base_dir = os.path.dirname(os.path.abspath(self.path))
+        fd, candidate_path = tempfile.mkstemp(
+            prefix=".mouse_colony_restore_", suffix=".db", dir=base_dir
+        )
+        try:
+            with os.fdopen(fd, "wb") as candidate:
+                candidate.write(data)
+            self.validate_database_file(candidate_path)
+
+            backup_dir = backup_dir or os.path.join(base_dir, "backups")
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup_path = os.path.join(
+                backup_dir, f"mouse_colony-before-restore-{timestamp}.db"
+            )
+            self.backup_to(backup_path)
+
+            os.replace(candidate_path, self.path)
+            candidate_path = None
+            try:
+                self._init_db()
+                self.validate_database_file(self.path)
+            except Exception as exc:
+                shutil.copy2(backup_path, self.path)
+                self._init_db()
+                raise ValueError(
+                    f"Restore failed; the previous database was restored: {exc}"
+                ) from None
+            return backup_path
+        finally:
+            if candidate_path and os.path.exists(candidate_path):
+                os.remove(candidate_path)
 
     def _init_db(self):
         with self._conn() as c:
@@ -115,6 +221,8 @@ class DB:
                     death_method TEXT,
                     previous_status TEXT,
                     previous_cage_location TEXT,
+                    previous_cage_id INTEGER REFERENCES breeding_cages(id),
+                    previous_cage_role TEXT,
                     notes TEXT,
                     created_at TEXT DEFAULT (datetime('now','localtime')),
                     UNIQUE(mouse_id)
@@ -202,6 +310,10 @@ class DB:
             c.execute("ALTER TABLE mouse_survival ADD COLUMN previous_status TEXT")
         if "previous_cage_location" not in survival_cols:
             c.execute("ALTER TABLE mouse_survival ADD COLUMN previous_cage_location TEXT")
+        if "previous_cage_id" not in survival_cols:
+            c.execute("ALTER TABLE mouse_survival ADD COLUMN previous_cage_id INTEGER REFERENCES breeding_cages(id)")
+        if "previous_cage_role" not in survival_cols:
+            c.execute("ALTER TABLE mouse_survival ADD COLUMN previous_cage_role TEXT")
 
     def _sync_breeding_mouse_statuses(self, c):
         rows = c.execute("""
@@ -219,6 +331,47 @@ class DB:
                 "UPDATE mice SET status='breeding', cage_location=? WHERE id=? AND status!='dead'",
                 (row["cage_label"], row["mouse_id"]),
             )
+
+        # A mouse in an active breeding cage is a breeder only when it is linked
+        # as a male or female parent. Other residents are pups waiting to split.
+        c.execute("""
+            UPDATE mice
+            SET status='waiting_split'
+            WHERE status='breeding'
+              AND status!='dead'
+              AND EXISTS (
+                  SELECT 1 FROM breeding_cages bc
+                  WHERE bc.cage_type='breeding'
+                    AND bc.status='active'
+                    AND bc.cage_label=mice.cage_location
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM breeding_cages bc
+                  WHERE bc.cage_type='breeding'
+                    AND bc.status='active'
+                    AND bc.male_id=mice.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM cage_females cf
+                  JOIN breeding_cages bc ON bc.id=cf.cage_id
+                  WHERE bc.cage_type='breeding'
+                    AND bc.status='active'
+                    AND cf.mouse_id=mice.id
+              )
+        """)
+
+        c.execute("""
+            UPDATE mice
+            SET status='holding'
+            WHERE status!='dead'
+              AND EXISTS (
+                  SELECT 1 FROM breeding_cages bc
+                  WHERE bc.cage_type='holding'
+                    AND bc.status='active'
+                    AND bc.cage_label=mice.cage_location
+              )
+        """)
 
     # ── Mice ──────────────────────────────────────────────
 
@@ -262,13 +415,85 @@ class DB:
             )
 
     def delete_mouse(self, mouse_id):
+        return self.safe_delete_mouse(mouse_id)
+
+    def get_mouse_delete_impact(self, mouse_id):
         with self._conn() as c:
+            mouse = c.execute("SELECT * FROM mice WHERE id=?", (mouse_id,)).fetchone()
+            if not mouse:
+                raise ValueError("Mouse not found.")
+            counts = {
+                "genotypes": c.execute(
+                    "SELECT COUNT(*) AS n FROM genotypes WHERE mouse_id=?", (mouse_id,)
+                ).fetchone()["n"],
+                "weights": c.execute(
+                    "SELECT COUNT(*) AS n FROM mouse_weights WHERE mouse_id=?", (mouse_id,)
+                ).fetchone()["n"],
+                "survival": c.execute(
+                    "SELECT COUNT(*) AS n FROM mouse_survival WHERE mouse_id=?", (mouse_id,)
+                ).fetchone()["n"],
+                "cage_links": c.execute(
+                    """SELECT (
+                           SELECT COUNT(*) FROM breeding_cages
+                           WHERE male_id=? OR female_id=?
+                       ) + (
+                           SELECT COUNT(*) FROM cage_females WHERE mouse_id=?
+                       ) AS n""",
+                    (mouse_id, mouse_id, mouse_id),
+                ).fetchone()["n"],
+                "children": c.execute(
+                    "SELECT COUNT(*) AS n FROM mice WHERE father_tag=? OR mother_tag=?",
+                    (mouse["ear_tag"], mouse["ear_tag"]),
+                ).fetchone()["n"],
+            }
+            return counts
+
+    def safe_delete_mouse(self, mouse_id):
+        impact = self.get_mouse_delete_impact(mouse_id)
+        with self._conn() as c:
+            mouse = c.execute("SELECT id FROM mice WHERE id=?", (mouse_id,)).fetchone()
+            if not mouse:
+                raise ValueError("Mouse not found.")
+            c.execute(
+                "UPDATE breeding_cages SET male_id=NULL WHERE male_id=?",
+                (mouse_id,),
+            )
+            c.execute(
+                "UPDATE breeding_cages SET female_id=NULL WHERE female_id=?",
+                (mouse_id,),
+            )
+            c.execute("DELETE FROM cage_females WHERE mouse_id=?", (mouse_id,))
             c.execute("DELETE FROM mice WHERE id=?", (mouse_id,))
+        return impact
+
+    def _validated_mouse_event_date(self, c, mouse_id, event_date, label):
+        mouse = c.execute(
+            "SELECT birth_date FROM mice WHERE id=?", (mouse_id,)
+        ).fetchone()
+        if not mouse:
+            raise ValueError("Mouse not found.")
+        try:
+            parsed = date.fromisoformat(str(event_date))
+        except (TypeError, ValueError):
+            raise ValueError(f"{label} must be a valid date.") from None
+        if parsed > date.today():
+            raise ValueError(f"{label} cannot be in the future.")
+        if mouse["birth_date"]:
+            try:
+                birth = date.fromisoformat(mouse["birth_date"])
+            except ValueError:
+                birth = None
+            if birth and parsed < birth:
+                raise ValueError(f"{label} cannot be before the birth date.")
+        return parsed
 
     # ── Weights and Survival ─────────────────────────────
 
     def upsert_weight(self, mouse_id, measure_date, weight_g, notes=None):
+        if weight_g <= 0:
+            raise ValueError("Weight must be greater than 0 g.")
         with self._conn() as c:
+            self._validated_mouse_event_date(c, mouse_id, measure_date, "Weight date")
             c.execute(
                 """INSERT INTO mouse_weights (mouse_id, measure_date, weight_g, notes)
                    VALUES (?,?,?,?)
@@ -282,12 +507,14 @@ class DB:
             c.execute("DELETE FROM mouse_weights WHERE id=?", (weight_id,))
 
     def get_weight_records(self, mouse_ids=None):
+        if mouse_ids is not None and not mouse_ids:
+            return []
         with self._conn() as c:
             sql = """SELECT w.*, m.ear_tag, m.sex, m.birth_date, m.cage_location
                      FROM mouse_weights w
                      JOIN mice m ON w.mouse_id = m.id"""
             params = []
-            if mouse_ids:
+            if mouse_ids is not None:
                 placeholders = ",".join("?" for _ in mouse_ids)
                 sql += f" WHERE w.mouse_id IN ({placeholders})"
                 params.extend(mouse_ids)
@@ -296,32 +523,71 @@ class DB:
 
     def set_survival_record(self, mouse_id, end_date, outcome, notes=None,
                             death_method=None, previous_status=None,
-                            previous_cage_location=None):
+                            previous_cage_location=None, previous_cage_id=None,
+                            previous_cage_role=None):
         with self._conn() as c:
+            self._validated_mouse_event_date(c, mouse_id, end_date, "Endpoint date")
             c.execute(
                 """INSERT INTO mouse_survival (
                        mouse_id, end_date, outcome, death_method,
-                       previous_status, previous_cage_location, notes
+                       previous_status, previous_cage_location,
+                       previous_cage_id, previous_cage_role, notes
                    )
-                   VALUES (?,?,?,?,?,?,?)
+                   VALUES (?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(mouse_id)
                    DO UPDATE SET end_date=excluded.end_date,
                                  outcome=excluded.outcome,
                                  death_method=excluded.death_method,
                                  previous_status=COALESCE(mouse_survival.previous_status, excluded.previous_status),
                                  previous_cage_location=COALESCE(mouse_survival.previous_cage_location, excluded.previous_cage_location),
+                                 previous_cage_id=COALESCE(mouse_survival.previous_cage_id, excluded.previous_cage_id),
+                                 previous_cage_role=COALESCE(mouse_survival.previous_cage_role, excluded.previous_cage_role),
                                  notes=excluded.notes""",
-                (mouse_id, end_date, outcome, death_method, previous_status, previous_cage_location, notes),
+                (
+                    mouse_id, end_date, outcome, death_method, previous_status,
+                    previous_cage_location, previous_cage_id,
+                    previous_cage_role, notes,
+                ),
             )
+
+    def _mouse_cage_assignment(self, c, mouse):
+        return c.execute(
+            """SELECT bc.*,
+                      CASE
+                          WHEN bc.male_id=? THEN 'male'
+                          WHEN EXISTS (
+                              SELECT 1 FROM cage_females cf
+                              WHERE cf.cage_id=bc.id AND cf.mouse_id=?
+                          ) THEN CASE WHEN bc.cage_type='breeding' THEN 'female' ELSE 'member' END
+                          ELSE 'location'
+                      END AS cage_role
+               FROM breeding_cages bc
+               WHERE bc.male_id=?
+                  OR EXISTS (
+                      SELECT 1 FROM cage_females cf
+                      WHERE cf.cage_id=bc.id AND cf.mouse_id=?
+                  )
+                  OR bc.cage_label=?
+               ORDER BY (bc.cage_label=?) DESC,
+                        (bc.status='active') DESC,
+                        bc.id DESC
+               LIMIT 1""",
+            (
+                mouse["id"], mouse["id"], mouse["id"], mouse["id"],
+                mouse["cage_location"], mouse["cage_location"],
+            ),
+        ).fetchone()
 
     def mark_mouse_dead(self, mouse_id, death_date, death_method, notes=None):
         with self._conn() as c:
             mouse = c.execute("SELECT * FROM mice WHERE id=?", (mouse_id,)).fetchone()
             if not mouse:
                 raise ValueError("Mouse not found.")
+            self._validated_mouse_event_date(c, mouse_id, death_date, "Death date")
             existing = c.execute(
                 "SELECT * FROM mouse_survival WHERE mouse_id=?", (mouse_id,)
             ).fetchone()
+            assignment = self._mouse_cage_assignment(c, mouse)
             previous_status = (
                 existing["previous_status"] if existing and existing["previous_status"]
                 else (mouse["status"] if mouse["status"] != "dead" else "holding")
@@ -330,24 +596,39 @@ class DB:
                 existing["previous_cage_location"] if existing and existing["previous_cage_location"]
                 else mouse["cage_location"]
             )
+            previous_cage_id = (
+                existing["previous_cage_id"] if existing and existing["previous_cage_id"]
+                else (assignment["id"] if assignment else None)
+            )
+            previous_cage_role = (
+                existing["previous_cage_role"] if existing and existing["previous_cage_role"]
+                else (assignment["cage_role"] if assignment else None)
+            )
             outcome = "dead" if death_method == "Natural death" else "censored"
             c.execute(
                 """INSERT INTO mouse_survival (
                        mouse_id, end_date, outcome, death_method,
-                       previous_status, previous_cage_location, notes
+                       previous_status, previous_cage_location,
+                       previous_cage_id, previous_cage_role, notes
                    )
-                   VALUES (?,?,?,?,?,?,?)
+                   VALUES (?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(mouse_id)
                    DO UPDATE SET end_date=excluded.end_date,
                                  outcome=excluded.outcome,
                                  death_method=excluded.death_method,
                                  previous_status=COALESCE(mouse_survival.previous_status, excluded.previous_status),
                                  previous_cage_location=COALESCE(mouse_survival.previous_cage_location, excluded.previous_cage_location),
+                                 previous_cage_id=COALESCE(mouse_survival.previous_cage_id, excluded.previous_cage_id),
+                                 previous_cage_role=COALESCE(mouse_survival.previous_cage_role, excluded.previous_cage_role),
                                  notes=excluded.notes""",
-                (mouse_id, death_date, outcome, death_method, previous_status, previous_cage, notes),
+                (
+                    mouse_id, death_date, outcome, death_method, previous_status,
+                    previous_cage, previous_cage_id, previous_cage_role, notes,
+                ),
             )
             c.execute("DELETE FROM cage_females WHERE mouse_id=?", (mouse_id,))
             c.execute("UPDATE breeding_cages SET male_id=NULL WHERE male_id=?", (mouse_id,))
+            c.execute("UPDATE breeding_cages SET female_id=NULL WHERE female_id=?", (mouse_id,))
             c.execute("UPDATE mice SET status='dead', cage_location=NULL WHERE id=?", (mouse_id,))
 
     def restore_dead_mouse(self, mouse_id):
@@ -360,23 +641,79 @@ class DB:
             status = record["previous_status"] or "holding"
             if status not in ("breeding", "holding", "waiting_split"):
                 status = "holding"
+            previous_cage_id = record["previous_cage_id"]
+            if not previous_cage_id and record["previous_cage_location"]:
+                row = c.execute(
+                    "SELECT id FROM breeding_cages WHERE cage_label=?",
+                    (record["previous_cage_location"],),
+                ).fetchone()
+                previous_cage_id = row["id"] if row else None
+
+            cage = None
+            if previous_cage_id:
+                cage = c.execute(
+                    "SELECT * FROM breeding_cages WHERE id=?", (previous_cage_id,)
+                ).fetchone()
+
+            warning = None
+            location = None
+            role = record["previous_cage_role"]
+            if cage and cage["status"] == "active":
+                location = cage["cage_label"]
+                if role == "male":
+                    if cage["male_id"] in (None, mouse_id):
+                        c.execute(
+                            "UPDATE breeding_cages SET male_id=? WHERE id=?",
+                            (mouse_id, cage["id"]),
+                        )
+                        status = "breeding"
+                    else:
+                        location = None
+                        status = "holding"
+                        warning = "Original male slot is already occupied; restored as unassigned holding."
+                elif role == "female":
+                    c.execute(
+                        "INSERT OR IGNORE INTO cage_females (cage_id, mouse_id) VALUES (?,?)",
+                        (cage["id"], mouse_id),
+                    )
+                    status = "breeding"
+                elif role in ("member", "location") and cage["cage_type"] == "holding":
+                    c.execute(
+                        "INSERT OR IGNORE INTO cage_females (cage_id, mouse_id) VALUES (?,?)",
+                        (cage["id"], mouse_id),
+                    )
+                    status = "holding"
+                elif not role and cage["cage_type"] == "holding":
+                    c.execute(
+                        "INSERT OR IGNORE INTO cage_females (cage_id, mouse_id) VALUES (?,?)",
+                        (cage["id"], mouse_id),
+                    )
+                    status = "holding"
+                elif cage["cage_type"] == "breeding":
+                    status = "waiting_split"
+            else:
+                status = "holding"
+                warning = "Original cage is unavailable or inactive; restored as unassigned holding."
             c.execute(
                 "UPDATE mice SET status=?, cage_location=? WHERE id=?",
-                (status, record["previous_cage_location"], mouse_id),
+                (status, location, mouse_id),
             )
             c.execute("DELETE FROM mouse_survival WHERE mouse_id=?", (mouse_id,))
+            return {"status": status, "cage_location": location, "warning": warning}
 
     def delete_survival_record(self, mouse_id):
         with self._conn() as c:
             c.execute("DELETE FROM mouse_survival WHERE mouse_id=?", (mouse_id,))
 
     def get_survival_records(self, mouse_ids=None):
+        if mouse_ids is not None and not mouse_ids:
+            return []
         with self._conn() as c:
             sql = """SELECT s.*, m.ear_tag, m.sex, m.birth_date, m.cage_location, m.status
                      FROM mouse_survival s
                      JOIN mice m ON s.mouse_id = m.id"""
             params = []
-            if mouse_ids:
+            if mouse_ids is not None:
                 placeholders = ",".join("?" for _ in mouse_ids)
                 sql += f" WHERE s.mouse_id IN ({placeholders})"
                 params.extend(mouse_ids)
@@ -388,6 +725,7 @@ class DB:
             return c.execute(
                 """SELECT m.*, s.end_date, s.outcome, s.death_method,
                           s.previous_status, s.previous_cage_location,
+                          s.previous_cage_id, s.previous_cage_role,
                           s.notes AS death_notes
                    FROM mouse_survival s
                    JOIN mice m ON s.mouse_id = m.id
@@ -595,6 +933,30 @@ class DB:
                 (cage_label,),
             ).fetchone()
 
+    def get_current_cage_mice(self, cage_id):
+        with self._conn() as c:
+            cage = c.execute(
+                "SELECT * FROM breeding_cages WHERE id=?", (cage_id,)
+            ).fetchone()
+            if not cage:
+                return []
+            return c.execute(
+                """SELECT DISTINCT m.*
+                   FROM mice m
+                   WHERE m.status!='dead'
+                     AND (
+                         m.cage_location=?
+                         OR m.id=?
+                         OR m.id=?
+                         OR EXISTS (
+                             SELECT 1 FROM cage_females cf
+                             WHERE cf.cage_id=? AND cf.mouse_id=m.id
+                         )
+                     )
+                   ORDER BY m.ear_tag""",
+                (cage["cage_label"], cage["male_id"], cage["female_id"], cage_id),
+            ).fetchall()
+
     def get_or_create_holding_cage(self, cage_label, setup_date=None, notes=None):
         existing = self.get_cage_by_label(cage_label)
         if existing:
@@ -622,7 +984,61 @@ class DB:
                 (*updates.values(), cage_id),
             )
 
+    def get_cage_delete_impact(self, cage_id):
+        with self._conn() as c:
+            cage = c.execute(
+                "SELECT * FROM breeding_cages WHERE id=?", (cage_id,)
+            ).fetchone()
+            if not cage:
+                raise ValueError("Cage not found.")
+            linked_members = c.execute(
+                """SELECT (CASE WHEN ? IS NULL THEN 0 ELSE 1 END) +
+                          (CASE WHEN ? IS NULL THEN 0 ELSE 1 END) +
+                          (SELECT COUNT(*) FROM cage_females WHERE cage_id=?) AS n""",
+                (cage["male_id"], cage["female_id"], cage_id),
+            ).fetchone()["n"]
+            impact = {
+                "linked_members": linked_members,
+                "located_mice": c.execute(
+                    "SELECT COUNT(*) AS n FROM mice WHERE cage_location=? AND status!='dead'",
+                    (cage["cage_label"],),
+                ).fetchone()["n"],
+                "birth_mice": c.execute(
+                    "SELECT COUNT(*) AS n FROM mice WHERE birth_cage_id=?", (cage_id,)
+                ).fetchone()["n"],
+                "litters": c.execute(
+                    "SELECT COUNT(*) AS n FROM litters WHERE cage_id=?", (cage_id,)
+                ).fetchone()["n"],
+                "reminders": c.execute(
+                    "SELECT COUNT(*) AS n FROM split_reminders WHERE cage_id=?", (cage_id,)
+                ).fetchone()["n"],
+            }
+            impact["can_delete"] = not any(impact.values())
+            return impact
+
+    def end_cage(self, cage_id, separation_date=None):
+        separation_date = separation_date or str(date.today())
+        with self._conn() as c:
+            cage = c.execute(
+                "SELECT * FROM breeding_cages WHERE id=?", (cage_id,)
+            ).fetchone()
+            if not cage:
+                raise ValueError("Cage not found.")
+            c.execute(
+                "UPDATE breeding_cages SET status='ended', separation_date=? WHERE id=?",
+                (separation_date, cage_id),
+            )
+            c.execute(
+                """UPDATE mice
+                   SET status='holding', cage_location=NULL
+                   WHERE cage_location=? AND status!='dead'""",
+                (cage["cage_label"],),
+            )
+
     def delete_cage(self, cage_id):
+        impact = self.get_cage_delete_impact(cage_id)
+        if not impact["can_delete"]:
+            raise ValueError("This cage has mice or history. End it instead of deleting it.")
         with self._conn() as c:
             c.execute("DELETE FROM cage_females WHERE cage_id=?", (cage_id,))
             c.execute("DELETE FROM breeding_cages WHERE id=?", (cage_id,))

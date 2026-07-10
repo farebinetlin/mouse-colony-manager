@@ -17,4 +17,11 @@ streamlit run app.py
 3. **Cages** → create cages and assign mice
 4. **Dashboard** → overview
 
-Optional demo data: `python test_data.py`
+Optional demo data:
+
+```bash
+python test_data.py
+MOUSE_COLONY_DB=demo_mouse_colony.db streamlit run app.py
+```
+
+The demo script refuses to write to the real `mouse_colony.db` unless explicitly overridden.

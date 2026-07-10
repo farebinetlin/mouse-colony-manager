@@ -1,9 +1,34 @@
-"""Test script: populate sample data and verify the mouse colony manager."""
+"""Populate a separate demo database without touching real colony data."""
+import argparse
+import os
 import sys
-sys.path.insert(0, "/Users/linfabin/mouse-manager")
-from db import DB
 
-db = DB()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE_DIR)
+
+from db import DB, DB_PATH
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument(
+    "--db",
+    default=os.path.join(BASE_DIR, "demo_mouse_colony.db"),
+    help="Path for the new demo database.",
+)
+parser.add_argument(
+    "--allow-real-db",
+    action="store_true",
+    help="Explicitly allow using the app's real database path.",
+)
+args = parser.parse_args()
+target_db = os.path.abspath(args.db)
+
+if target_db == os.path.abspath(DB_PATH) and not args.allow_real_db:
+    raise SystemExit("Refusing to write demo data into the real mouse_colony.db.")
+if os.path.exists(target_db) and os.path.getsize(target_db) > 0:
+    raise SystemExit(f"Demo database already exists: {target_db}")
+
+db = DB(target_db)
 
 print("=== Adding founder mice ===")
 m1 = db.add_mouse("F-M001", "2024-06-01", "M", status="breeding",
@@ -30,13 +55,13 @@ print(f"  {m4}: F-F002 F GeneA fl/fl")
 
 print("\n=== Creating breeding cages ===")
 cage1 = db.add_breeding_cage("Breed-01", cage_type="breeding",
-                              male_id=m1, female_id=m2,
+                              male_id=m1,
                               setup_date="2025-01-15")
 db.set_cage_females(cage1, [m2])
 print(f"  {cage1}: Breed-01 (F-M001 x F-F001)")
 
 cage2 = db.add_breeding_cage("Breed-02", cage_type="breeding",
-                              male_id=m3, female_id=m4,
+                              male_id=m3,
                               setup_date="2025-01-20")
 db.set_cage_females(cage2, [m4])
 print(f"  {cage2}: Breed-02 (F-M002 x F-F002)")
@@ -120,5 +145,6 @@ print(f"  Unknown genotypes: {stats['unknown_genotypes']}")
 print(f"  Pending alerts: {stats['pending_alerts']}")
 
 print("\n=== All tests passed! ===")
-print("Run: streamlit run app.py")
+print(f"Demo database: {target_db}")
+print(f"Run: MOUSE_COLONY_DB='{target_db}' streamlit run app.py")
 print("Then open http://localhost:8501 to explore the data.")

@@ -1,6 +1,9 @@
 import streamlit as st
 from db import DB
+from survival_analysis import kaplan_meier_points
 from datetime import date, timedelta
+import altair as alt
+import os
 import re
 import html
 import pandas as pd
@@ -1285,33 +1288,9 @@ def cage_gene_names(cage):
 
 
 def cage_mice(cage):
-    is_breeding = cage["cage_type"] == "breeding"
-    born_here = db.get_mice_by_birth_cage(cage["id"])
-
-    # Mice assigned via cage_females (works for both breeding and holding cages)
-    assigned = []
-    if cage["male_tag"]:
-        male = db.get_mouse_by_tag(cage["male_tag"])
-        if male:
-            assigned.append(male)
-    for tag in female_tag_list(cage):
-        female = db.get_mouse_by_tag(tag)
-        if female:
-            assigned.append(female)
-
-    # Also include mice currently located in this cage. This keeps older imports
-    # visible even if they were not linked through birth_cage_id.
-    by_location = [m for m in db.get_all_mice() if m["cage_location"] == cage["cage_label"]]
-
-    seen = set()
-    unique = []
-    for mouse in assigned + born_here + by_location:
-        if mouse["status"] == "dead":
-            continue
-        if mouse["id"] not in seen:
-            seen.add(mouse["id"])
-            unique.append(mouse)
-    return unique
+    # birth_cage_id is historical provenance. Current membership comes from
+    # parent/member links and the mouse's current cage location only.
+    return list(db.get_current_cage_mice(cage["id"]))
 
 
 def mouse_option_label(mouse):
@@ -1384,8 +1363,14 @@ def assign_table_mice_to_cage(mouse_ids, cage):
         return 0
 
     unlink_mice_from_cage_links(mouse_ids, keep_cage_id=cage["id"])
-    target_status = "holding" if cage["cage_type"] == "holding" else "breeding"
+    parent_ids = {cage["male_id"]} if cage["male_id"] else set()
+    if cage["cage_type"] == "breeding":
+        parent_ids.update(m["id"] for m in db.get_cage_females(cage["id"]))
     for mouse_id in mouse_ids:
+        if cage["cage_type"] == "holding":
+            target_status = "holding"
+        else:
+            target_status = "breeding" if mouse_id in parent_ids else "waiting_split"
         db.update_mouse(mouse_id, status=target_status, cage_location=cage["cage_label"])
 
     if cage["cage_type"] == "holding":
@@ -1520,7 +1505,7 @@ def render_top_nav():
             item["label"],
             key=f"nav_{item['key']}",
             type="primary" if is_current else "secondary",
-            use_container_width=True,
+            width="stretch",
         ):
             go_to_page(item["key"])
 
@@ -1580,11 +1565,11 @@ def dashboard_page():
             unsafe_allow_html=True,
         )
         a1, a2, a3, _ = st.columns([1, 1, 1, 3])
-        if a1.button("Add genes", key="empty_add_genes", use_container_width=True):
+        if a1.button("Add genes", key="empty_add_genes", width="stretch"):
             go_to_page("settings")
-        if a2.button("Import mice", key="empty_import_mice", use_container_width=True):
+        if a2.button("Import mice", key="empty_import_mice", width="stretch"):
             go_to_page("add_import")
-        if a3.button("Create cage", key="empty_create_cage", use_container_width=True):
+        if a3.button("Create cage", key="empty_create_cage", width="stretch"):
             go_to_page("cages")
 
     st.divider()
@@ -1774,7 +1759,10 @@ def _weight_mouse_selection():
             "Include": True,
             "ID": str(mouse["ear_tag"]),
             "Sex": sex_display(mouse["sex"]),
-            "Age": mouse_age_label(mouse["birth_date"]),
+            "Age": mouse_age_label(
+                mouse["birth_date"],
+                parse_date(mouse["end_date"]) if mouse["status"] == "dead" else None,
+            ),
             "Cage": mouse["cage_location"] or mouse["previous_cage_location"] or "unassigned",
             "Genotype": genotype_summary(mouse["id"]),
         }
@@ -1784,7 +1772,7 @@ def _weight_mouse_selection():
     edited = st.data_editor(
         pd.DataFrame(rows),
         key=f"weight_mouse_table_{cage_sig}",
-        use_container_width=True,
+            width="stretch",
         hide_index=True,
         disabled=["ID", "Sex", "Age", "Cage", "Genotype"],
         column_config={
@@ -1817,7 +1805,16 @@ def _record_weight_panel(mice):
         notes = st.text_input("Notes", key="weight_notes")
         submitted = st.form_submit_button("Save weight")
         if submitted:
-            db.upsert_weight(label_to_id[mouse_label], str(measure_date), float(weight_g), notes.strip() or None)
+            try:
+                db.upsert_weight(
+                    label_to_id[mouse_label],
+                    str(measure_date),
+                    float(weight_g),
+                    notes.strip() or None,
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+                return
             st.success("Weight saved.")
             st.rerun()
 
@@ -1834,7 +1831,7 @@ def _record_weight_panel(mice):
                 }
                 for r in records
             ]
-            st.dataframe(table, use_container_width=True, hide_index=True)
+            st.dataframe(table, width="stretch", hide_index=True)
             delete_options = {
                 f"{r['measure_date']} · {r['ear_tag']} · {r['weight_g']} g": r["id"]
                 for r in records
@@ -1865,7 +1862,16 @@ def _record_survival_panel(mice):
             notes = st.text_input("Death notes", key="survival_notes")
             submitted = st.form_submit_button("Mark dead")
             if submitted:
-                db.mark_mouse_dead(label_to_id[mouse_label], str(end_date), death_method, notes.strip() or None)
+                try:
+                    db.mark_mouse_dead(
+                        label_to_id[mouse_label],
+                        str(end_date),
+                        death_method,
+                        notes.strip() or None,
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                    return
                 st.success(f"Marked {mouse_label} as dead.")
                 st.rerun()
     else:
@@ -1879,13 +1885,13 @@ def _record_survival_panel(mice):
                     "Mouse": r["ear_tag"],
                     "Sex": sex_display(r["sex"]),
                     "Method": r["death_method"] or survival_outcome_label(r["outcome"]),
-                    "Curve": "event" if r["outcome"] in ("dead", "euthanized") else "censored",
+                    "Curve": death_curve_label(r),
                     "Date": r["end_date"],
                     "Notes": r["notes"] or "",
                 }
                 for r in records
             ]
-            st.dataframe(table, use_container_width=True, hide_index=True)
+            st.dataframe(table, width="stretch", hide_index=True)
 
 
 def survival_outcome_label(outcome):
@@ -1897,7 +1903,11 @@ def survival_outcome_label(outcome):
 
 
 def death_curve_label(record):
-    return "event" if record["outcome"] in ("dead", "euthanized") else "censored"
+    if record["death_method"] == "Natural death":
+        return "event"
+    if record["death_method"] == "Experimental harvest":
+        return "censored"
+    return "event" if record["outcome"] == "dead" else "censored"
 
 
 def _death_archive_page():
@@ -1930,7 +1940,7 @@ def _death_archive_page():
         {
             "ID": r["ear_tag"],
             "Sex": sex_display(r["sex"]),
-            "Age": mouse_age_label(r["birth_date"]),
+            "Age": mouse_age_label(r["birth_date"], parse_date(r["end_date"])),
             "Original cage": r["previous_cage_location"] or "—",
             "Death date": r["end_date"],
             "Death method": r["death_method"] or survival_outcome_label(r["outcome"]),
@@ -1940,7 +1950,7 @@ def _death_archive_page():
         }
         for r in records
     ]
-    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.dataframe(table, width="stretch", hide_index=True)
 
     restore_options = {
         f"{r['ear_tag']} · {r['end_date']} · {r['death_method'] or survival_outcome_label(r['outcome'])}": r["id"]
@@ -1952,16 +1962,23 @@ def _death_archive_page():
         restore = r2.form_submit_button("Restore")
         if restore:
             try:
-                db.restore_dead_mouse(restore_options[target])
+                result = db.restore_dead_mouse(restore_options[target])
             except ValueError as exc:
                 st.error(str(exc))
                 return
-            st.success("Mouse restored.")
+            if result.get("warning"):
+                st.warning(result["warning"])
+            else:
+                restored_to = result.get("cage_location") or "unassigned"
+                st.success(f"Mouse restored to {restored_to}.")
             st.rerun()
 
 
 def _render_weight_curve(mouse_ids):
     st.markdown('<div class="detail-section-title">Weight Curve</div>', unsafe_allow_html=True)
+    if not mouse_ids:
+        st.info("No mice selected.")
+        return
     records = db.get_weight_records(mouse_ids)
     if not records:
         st.info("No weight records for the selected mice.")
@@ -1994,6 +2011,7 @@ def _render_survival_curve(mice):
     survival_rows = db.get_survival_records([m["id"] for m in mice])
     survival_by_mouse = {row["mouse_id"]: row for row in survival_rows}
     durations = []
+    events = []
     skipped = []
     today = date.today()
 
@@ -2005,40 +2023,43 @@ def _render_survival_curve(mice):
         endpoint = survival_by_mouse.get(mouse["id"])
         if endpoint:
             end = parse_date(endpoint["end_date"]) or today
-            event = endpoint["outcome"] in ("dead", "euthanized")
+            if endpoint["death_method"] == "Natural death":
+                event = True
+            elif endpoint["death_method"] == "Experimental harvest":
+                event = False
+            else:
+                event = endpoint["outcome"] == "dead"
         else:
             end = today
             event = False
-        durations.append(
-            {
-                "mouse": mouse["ear_tag"],
-                "day": max(0, (end - birth).days),
-                "event": event,
-            }
-        )
+        durations.append(max(0, (end - birth).days))
+        events.append(event)
 
     if not durations:
         st.info("Selected mice need birth dates for survival plotting.")
         return
 
+    points = kaplan_meier_points(durations, events)
+    chart = (
+        alt.Chart(points)
+        .mark_line(interpolate="step-after", strokeWidth=2.4, color="#527DA8")
+        .encode(
+            x=alt.X("Day:Q", title="Day", scale=alt.Scale(zero=True)),
+            y=alt.Y(
+                "Survival (%):Q",
+                title="Survival (%)",
+                scale=alt.Scale(domain=[0, 100]),
+            ),
+            tooltip=[
+                alt.Tooltip("Day:Q", format=".0f"),
+                alt.Tooltip("Survival (%):Q", format=".1f"),
+            ],
+        )
+        .properties(height=330)
+    )
+    st.altair_chart(chart, width="stretch")
     n = len(durations)
-    survivors = n
-    current = 100.0
-    points = [{"Day": 0, "Survival (%)": 100.0}]
-    event_days = sorted({d["day"] for d in durations if d["event"]})
-    for day in event_days:
-        deaths = sum(1 for d in durations if d["event"] and d["day"] == day)
-        points.append({"Day": day, "Survival (%)": current})
-        survivors -= deaths
-        current = max(0.0, survivors / n * 100.0)
-        points.append({"Day": day, "Survival (%)": current})
-
-    max_day = max(d["day"] for d in durations)
-    if max_day > points[-1]["Day"]:
-        points.append({"Day": max_day, "Survival (%)": current})
-
-    st.line_chart(pd.DataFrame(points), x="Day", y="Survival (%)", height=330)
-    event_count = sum(1 for d in durations if d["event"])
+    event_count = sum(events)
     st.caption(f"{n} mice plotted · {event_count} endpoint event(s) · {n - event_count} censored/alive")
     if skipped:
         st.warning("Skipped mice without birth date: " + ", ".join(skipped))
@@ -2133,7 +2154,7 @@ def _bulk_import_form():
                                 ) or "—",
                             }
                         )
-                    st.dataframe(preview_rows, use_container_width=True, hide_index=True)
+                    st.dataframe(preview_rows, width="stretch", hide_index=True)
 
                 if import_errors:
                     st.error("Fix these issues before importing:")
@@ -2529,7 +2550,7 @@ def _mouse_view_mode_toggle():
         "Cards",
         key="mouse_view_cards",
         type="primary" if card_active else "secondary",
-        use_container_width=True,
+            width="stretch",
     ):
         st.session_state.mouse_view_mode = "cards"
         st.rerun()
@@ -2537,7 +2558,7 @@ def _mouse_view_mode_toggle():
         "Table",
         key="mouse_view_table",
         type="primary" if table_active else "secondary",
-        use_container_width=True,
+            width="stretch",
     ):
         st.session_state.mouse_view_mode = "table"
         st.rerun()
@@ -2618,7 +2639,7 @@ def _render_mouse_table_view(mice):
     edited = st.data_editor(
         pd.DataFrame(rows),
         key=f"mouse_table_view_{table_sig}",
-        use_container_width=True,
+            width="stretch",
         hide_index=True,
         disabled=["Color", "ID", "Age", "Sex", "Status", "Cage", "Genotype", "Father", "Mother", "Notes"],
         column_config={
@@ -2679,7 +2700,7 @@ def _render_mouse_table_assign_controls(assign_tags, tag_to_mouse):
         "Assign to cage",
         key="mouse_table_assign_to_cage",
         type="primary",
-        use_container_width=True,
+            width="stretch",
         disabled=not selected_live,
     )
 
@@ -2730,7 +2751,7 @@ def _render_mouse_card(mouse):
         if st.button(
             "Close" if selected else "Open",
             key=f"sel_mouse_{mouse['id']}",
-            use_container_width=True,
+            width="stretch",
             type="primary" if selected else "secondary",
         ):
             st.session_state.selected_mouse_id = None if selected else mouse["id"]
@@ -2895,6 +2916,7 @@ def _mouse_detail(mouse):
         st.markdown(f"```\n{tree}\n```")
 
     with st.expander("Edit Mouse", expanded=False):
+        delete_impact = db.get_mouse_delete_impact(mouse["id"])
         with st.form(f"edit_mouse_{mouse['id']}"):
             ec1, ec2, ec3 = st.columns(3)
             new_tag = ec1.text_input("Ear Tag", value=mouse["ear_tag"], key=f"et_{mouse['id']}")
@@ -2922,9 +2944,25 @@ def _mouse_detail(mouse):
             new_mother = ec5.text_input("Mother Tag", value=mouse["mother_tag"] or "", key=f"mt_{mouse['id']}")
             new_notes = st.text_area("Notes", value=mouse["notes"] or "", key=f"nt_{mouse['id']}")
 
+            st.caption(
+                "Deleting also removes "
+                f"{delete_impact['genotypes']} genotype, "
+                f"{delete_impact['weights']} weight and "
+                f"{delete_impact['survival']} endpoint record(s). "
+                f"It is linked to {delete_impact['cage_links']} cage(s)."
+            )
+            confirm_delete = st.checkbox(
+                "Confirm permanent deletion",
+                value=False,
+                key=f"confirm_delete_mouse_{mouse['id']}",
+            )
+
             btn_col1, btn_col2, _ = st.columns([1, 1, 4])
             save = btn_col1.form_submit_button("💾 Save")
-            delete = btn_col2.form_submit_button("🗑️ Delete", type="secondary")
+            delete = btn_col2.form_submit_button(
+                "🗑️ Delete",
+                type="secondary",
+            )
 
             if save:
                 db.update_mouse(
@@ -2942,7 +2980,11 @@ def _mouse_detail(mouse):
                 st.rerun()
 
             if delete:
-                db.delete_mouse(mouse["id"])
+                if not confirm_delete:
+                    st.error("Check the confirmation box before deleting this mouse.")
+                    return
+                db.safe_delete_mouse(mouse["id"])
+                st.session_state.selected_mouse_id = None
                 st.warning(f"Deleted mouse '{mouse['ear_tag']}'.")
                 st.rerun()
 
@@ -2967,12 +3009,16 @@ def _mouse_detail(mouse):
                 )
                 mark_dead = st.form_submit_button("Mark dead", type="secondary")
                 if mark_dead:
-                    db.mark_mouse_dead(
-                        mouse["id"],
-                        str(death_date),
-                        death_method,
-                        death_notes.strip() or None,
-                    )
+                    try:
+                        db.mark_mouse_dead(
+                            mouse["id"],
+                            str(death_date),
+                            death_method,
+                            death_notes.strip() or None,
+                        )
+                    except ValueError as exc:
+                        st.error(str(exc))
+                        return
                     st.session_state.selected_mouse_id = None
                     st.warning(f"Marked {mouse['ear_tag']} as dead.")
                     st.rerun()
@@ -3312,7 +3358,7 @@ def _render_cage_card(cage):
         if st.button(
             f"Open {cage['cage_label']}",
             key=f"cage_click_{cage['id']}",
-            use_container_width=True,
+            width="stretch",
         ):
             st.session_state.selected_cage_id = None if selected else cage["id"]
             st.rerun()
@@ -3326,7 +3372,7 @@ def _render_cage_detail(cage):
     with st.container(border=True):
         title_col, close_col = st.columns([5, 1])
         title_col.subheader(f"{cage['cage_label']} details")
-        if close_col.button("Close details", key=f"close_cage_{cage['id']}", use_container_width=True):
+        if close_col.button("Close details", key=f"close_cage_{cage['id']}", width="stretch"):
             st.session_state.selected_cage_id = None
             st.rerun()
 
@@ -3382,10 +3428,10 @@ def _render_split_reminder_panel(cage):
             if reminder["notes"]:
                 note += f" · {reminder['notes']}"
             c2.markdown(f"**{note}**")
-            if c3.button("Done", key=f"done_split_reminder_{reminder['id']}", use_container_width=True):
+            if c3.button("Done", key=f"done_split_reminder_{reminder['id']}", width="stretch"):
                 db.resolve_split_reminder(reminder["id"], str(date.today()))
                 st.rerun()
-            if c4.button("Delete", key=f"del_split_reminder_{reminder['id']}", use_container_width=True):
+            if c4.button("Delete", key=f"del_split_reminder_{reminder['id']}", width="stretch"):
                 db.delete_split_reminder(reminder["id"])
                 st.rerun()
     else:
@@ -3604,7 +3650,7 @@ def _render_pup_table(pups):
             "Status": pup["status"],
             "Genotype": genotype_summary(pup["id"]),
         })
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(rows, width="stretch", hide_index=True)
 
 
 def _delete_litter_form(litter, pups):
@@ -3729,7 +3775,16 @@ def _mark_dead_form(mouse, key_prefix):
             notes = st.text_input("Death notes", key=f"death_notes_{key_prefix}")
             submitted = st.form_submit_button("Mark dead", type="secondary")
             if submitted:
-                db.mark_mouse_dead(mouse["id"], str(death_date), death_method, notes.strip() or None)
+                try:
+                    db.mark_mouse_dead(
+                        mouse["id"],
+                        str(death_date),
+                        death_method,
+                        notes.strip() or None,
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                    return
                 st.warning(f"Marked {mouse['ear_tag']} as dead.")
                 st.rerun()
 
@@ -3737,6 +3792,7 @@ def _mark_dead_form(mouse, key_prefix):
 def _edit_cage_form(cage):
     is_breeding = cage["cage_type"] == "breeding"
     cage_members = cage_mice(cage)
+    delete_impact = db.get_cage_delete_impact(cage["id"])
     current_female_ids = [m["id"] for m in db.get_cage_females(cage["id"])]
     current_occupant_ids = [m["id"] for m in cage_members]
     status_options = ["active", "separated", "ended"]
@@ -3814,12 +3870,30 @@ def _edit_cage_form(cage):
             new_male_id = None
             new_female_ids = []
             selected_member_ids = [occupant_label_to_id[label] for label in selected_occupant_labels]
-            new_member_ids = list(dict.fromkeys(current_occupant_ids + selected_member_ids))
+            new_member_ids = list(dict.fromkeys(selected_member_ids))
 
-        c1, c2, _ = st.columns([1, 1, 4])
+        if delete_impact["can_delete"]:
+            confirm_delete_cage = st.checkbox(
+                "Confirm permanent cage deletion",
+                value=False,
+                key=f"confirm_delete_cage_{cage['id']}",
+            )
+        else:
+            confirm_delete_cage = False
+            st.caption(
+                "This cage has current members or history and cannot be permanently deleted. "
+                "Use End Cage to preserve its records."
+            )
+
+        c1, c2, c3, _ = st.columns([1, 1, 1, 3])
         save = c1.form_submit_button("💾 Save Cage")
-        delete = c2.form_submit_button("🗑️ Delete Cage", type="secondary")
-        if save:
+        end_cage = c2.form_submit_button("End Cage", type="secondary")
+        delete = c3.form_submit_button(
+            "🗑️ Delete Cage",
+            type="secondary",
+            disabled=not delete_impact["can_delete"],
+        )
+        if save or end_cage:
             clean_label = new_label.strip()
             if not clean_label:
                 st.error("Cage label is required.")
@@ -3832,20 +3906,31 @@ def _edit_cage_form(cage):
                 st.error(f"Cage '{clean_label}' already exists.")
                 return
 
+            assign_mice_to_cage(cage, new_member_ids, cage["cage_type"], clean_label)
             db.update_breeding_cage(
                 cage["id"],
                 cage_label=clean_label,
                 male_id=new_male_id,
-                status=new_status,
+                status="ended" if end_cage else new_status,
                 separation_date=new_sep.strip() or None,
                 notes=new_notes.strip() or None,
             )
             db.set_cage_females(cage["id"], new_female_ids if is_breeding else new_member_ids)
-            assign_mice_to_cage(cage, new_member_ids, cage["cage_type"], clean_label)
-            st.success("Updated.")
+            if end_cage or new_status == "ended":
+                db.end_cage(cage["id"], new_sep.strip() or str(date.today()))
+                st.success("Cage ended and current mice were released to unassigned holding.")
+            else:
+                st.success("Updated.")
             st.rerun()
         if delete:
-            db.delete_cage(cage["id"])
+            if not confirm_delete_cage:
+                st.error("Check the confirmation box before deleting this cage.")
+                return
+            try:
+                db.delete_cage(cage["id"])
+            except ValueError as exc:
+                st.error(str(exc))
+                return
             st.session_state.selected_cage_id = None
             st.warning(f"Cage '{cage['cage_label']}' deleted.")
             st.rerun()
@@ -3989,9 +4074,20 @@ def settings_page():
     uploaded_db = st.file_uploader("Upload .db file to restore everything", type=["db"], key="import_db")
     if uploaded_db is not None:
         if st.button("⚠️ Replace current database with uploaded file", key="confirm_db_import"):
-            with open(db.path, "wb") as f:
-                f.write(uploaded_db.read())
-            st.success("Database replaced. Refreshing...")
+            backup_root = os.path.join(
+                os.path.expanduser("~"), "mouse-colony-backups", "restores"
+            )
+            try:
+                backup_path = db.restore_from_bytes(
+                    uploaded_db.getvalue(), backup_dir=backup_root
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+                return
+            st.success(
+                "Database validated and restored. Previous database backed up to "
+                f"{backup_path}."
+            )
             st.rerun()
 
     # ── Import CSV ──
